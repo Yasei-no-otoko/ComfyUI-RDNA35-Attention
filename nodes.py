@@ -433,7 +433,7 @@ class RDNA35PISARuntimeReport:
             raise RuntimeError("RDNA35 PISA runtime state is not attached to this MODEL")
         hits = sum(state.per_layer_hits.values())
         if hits == 0:
-            raise RuntimeError("INVALID BENCHMARK: PISA backend was not executed")
+            raise RuntimeError(f"INVALID BENCHMARK: PISA backend was not executed: {state.report()}")
         if set(state.per_layer_hits) == {-1}:
             if state.failed:
                 raise RuntimeError(f"Generic PISA runtime failed: {state.report()}")

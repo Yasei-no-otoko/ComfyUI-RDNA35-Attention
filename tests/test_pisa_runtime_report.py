@@ -54,8 +54,9 @@ class PISARuntimeReportTests(unittest.TestCase):
 
     def test_zero_hits_are_rejected_as_an_invalid_benchmark(self):
         state = PISARuntimeState(armed=True)
+        state.record(is_self_attention=True, shape=(1, 8, 4096, 64), fallback_reason="tokens_4096_below_8192")
 
-        with self.assertRaisesRegex(RuntimeError, "INVALID BENCHMARK: PISA backend was not executed"):
+        with self.assertRaisesRegex(RuntimeError, "PISA backend was not executed.*tokens_4096_below_8192"):
             RDNA35PISARuntimeReport().run(DummyModel(state), {"samples": object()})
 
     def test_incomplete_layer_accounting_is_rejected(self):
