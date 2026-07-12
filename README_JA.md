@@ -18,6 +18,10 @@ Gitから導入する場合は、このrepositoryを`ComfyUI/custom_nodes`へclo
 
 PISA CK/Flex経路はWindows・gfx1151・BF16専用です。`native/rdna35_pisa_ck`を使用中のPyTorch/ROCm環境でビルドし、wheelを`pip install --no-deps`で導入する必要があります。generic fixed-block reference/Triton nodesはこのnative wheelなしでも使用できます。
 
+## gfx1151実測
+
+Anima INT8_ConvRot、1536x1536、Spectrum 30 steps、CFG 5、17 actual forwardsのABBA測定では、FlashのSampler中央値76.08秒に対して融合PISAは65.94秒で、13.3%短縮しました。Prompt中央値は78.54秒から68.38秒へ12.9%短縮しています。runtime verifierで対象self-attention 24/24、cross-attention 0、fallback 0を確認済みです。
+
 ## 安全性と制限
 
 - inference forward専用

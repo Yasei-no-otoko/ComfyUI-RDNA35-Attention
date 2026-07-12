@@ -213,6 +213,53 @@ __global__ void unpack_spatial_output_kernel(
 }
 
 
+__global__ void fuse_spatial_epilogue_kernel(
+    const ck_tile::bf16_t* __restrict__ exact_output,
+    const float* __restrict__ exact_lse,
+    const ck_tile::bf16_t* __restrict__ approximate_output,
+    const float* __restrict__ approximate_lse,
+    const float* __restrict__ correction,
+    ck_tile::bf16_t* __restrict__ output,
+    int64_t heads)
+{
+    __shared__ float exact_weights[kTokensPerCopyBlock];
+    __shared__ float approximate_weights[kTokensPerCopyBlock];
+    const int64_t batch_head = static_cast<int64_t>(blockIdx.x) / kTokenCopyBlocks;
+    const int token_block = static_cast<int>(blockIdx.x % kTokenCopyBlocks);
+    const int token_in_block = threadIdx.x / kVectorsPerHead;
+    const int vector = threadIdx.x % kVectorsPerHead;
+    const int ordered = token_block * kTokensPerCopyBlock + token_in_block;
+    const int raster = ordered_to_raster(ordered);
+    const int64_t batch = batch_head / heads;
+    const int64_t head = batch_head % heads;
+    const int64_t source_offset = (batch_head * kMaxTokens + ordered) * kHeadDim;
+    const int64_t destination_offset = ((batch * kMaxTokens + raster) * heads + head) * kHeadDim;
+    if(vector == 0)
+    {
+        const float exact_logsumexp = exact_lse[batch_head * kMaxTokens + ordered];
+        const float approximate_logsumexp = approximate_lse[batch_head * kMaxTokens + ordered];
+        const float maximum = fmaxf(exact_logsumexp, approximate_logsumexp);
+        const float total_logsumexp = maximum + logf(expf(exact_logsumexp - maximum) + expf(approximate_logsumexp - maximum));
+        exact_weights[token_in_block] = expf(exact_logsumexp - total_logsumexp);
+        approximate_weights[token_in_block] = expf(approximate_logsumexp - total_logsumexp);
+    }
+    __syncthreads();
+    const float exact_weight = exact_weights[token_in_block];
+    const float approximate_weight = approximate_weights[token_in_block];
+    const int element_base = vector * kCopyElements;
+
+#pragma unroll
+    for(int element = 0; element < kCopyElements; ++element)
+    {
+        const int64_t offset = source_offset + element_base + element;
+        const float merged = load_float(exact_output, offset) * exact_weight
+            + load_float(approximate_output, offset) * approximate_weight
+            + correction[offset] * approximate_weight;
+        output[destination_offset + element_base + element] = ck_tile::type_convert<ck_tile::bf16_t>(merged);
+    }
+}
+
+
 void check_launch()
 {
     const hipError_t error = hipGetLastError();
@@ -365,6 +412,34 @@ void launch_unpack_spatial_output(
     check_copy_launch("PISA spatial output unpack");
 }
 
+
+void launch_fuse_spatial_epilogue(
+    const torch::Tensor& exact_output,
+    const torch::Tensor& exact_lse,
+    const torch::Tensor& approximate_output,
+    const torch::Tensor& approximate_lse,
+    const torch::Tensor& correction,
+    torch::Tensor& output,
+    int64_t heads,
+    int64_t grid_blocks,
+    hipStream_t stream)
+{
+    hipLaunchKernelGGL(
+        fuse_spatial_epilogue_kernel,
+        dim3(static_cast<std::uint32_t>(grid_blocks)),
+        dim3(kCopyThreads),
+        0,
+        stream,
+        reinterpret_cast<const ck_tile::bf16_t*>(exact_output.data_ptr()),
+        exact_lse.data_ptr<float>(),
+        reinterpret_cast<const ck_tile::bf16_t*>(approximate_output.data_ptr()),
+        approximate_lse.data_ptr<float>(),
+        correction.data_ptr<float>(),
+        reinterpret_cast<ck_tile::bf16_t*>(output.data_ptr()),
+        heads);
+    check_copy_launch("PISA spatial fused epilogue");
+}
+
 } // namespace
 
 
@@ -471,4 +546,70 @@ torch::Tensor pisa_unpack_spatial_output(torch::Tensor output, int64_t batch, in
 
     launch_unpack_spatial_output(output, unpacked, heads, grid_blocks, stream);
     return unpacked;
+}
+
+
+torch::Tensor pisa_fuse_spatial_epilogue(
+    torch::Tensor exact_output,
+    torch::Tensor exact_lse,
+    torch::Tensor approximate_output,
+    torch::Tensor approximate_lse,
+    torch::Tensor correction,
+    int64_t batch,
+    int64_t heads)
+{
+    TORCH_CHECK(batch > 0 && heads > 0, "PISA spatial fused epilogue requires positive batch and heads.");
+    TORCH_CHECK(batch <= std::numeric_limits<int64_t>::max() / heads, "PISA spatial fused epilogue batch-head size overflow.");
+    const int64_t batch_heads = batch * heads;
+    const auto check_output = [batch_heads](const torch::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be a HIP device tensor.");
+        TORCH_CHECK(tensor.dim() == 3 && tensor.size(0) == batch_heads && tensor.size(1) == kMaxTokens && tensor.size(2) == kHeadDim, name, " must have shape [B*H,9216,128].");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous.");
+        TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name, " must be bfloat16.");
+        TORCH_CHECK(!tensor.requires_grad(), name, " is forward-only.");
+    };
+    const auto check_lse = [batch_heads](const torch::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be a HIP device tensor.");
+        TORCH_CHECK(tensor.dim() == 2 && tensor.size(0) == batch_heads && tensor.size(1) == kMaxTokens, name, " must have shape [B*H,9216].");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous.");
+        TORCH_CHECK(tensor.scalar_type() == at::kFloat, name, " must be float32.");
+        TORCH_CHECK(!tensor.requires_grad(), name, " is forward-only.");
+    };
+    check_output(exact_output, "exact output");
+    check_output(approximate_output, "approximate output");
+    TORCH_CHECK(correction.is_cuda(), "correction must be a HIP device tensor.");
+    TORCH_CHECK(correction.dim() == 3 && correction.size(0) == batch_heads && correction.size(1) == kMaxTokens && correction.size(2) == kHeadDim, "correction must have shape [B*H,9216,128].");
+    TORCH_CHECK(correction.is_contiguous(), "correction must be contiguous.");
+    TORCH_CHECK(correction.scalar_type() == at::kFloat, "correction must be float32.");
+    TORCH_CHECK(!correction.requires_grad(), "correction is forward-only.");
+    check_lse(exact_lse, "exact LSE");
+    check_lse(approximate_lse, "approximate LSE");
+    TORCH_CHECK(
+        exact_output.device() == approximate_output.device()
+            && exact_output.device() == correction.device()
+            && exact_output.device() == exact_lse.device()
+            && exact_output.device() == approximate_lse.device(),
+        "PISA spatial fused epilogue tensors must share one device.");
+    check_aligned(exact_output, "exact output");
+    check_aligned(approximate_output, "approximate output");
+    check_aligned(correction, "correction");
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{exact_output.device()};
+    hipDeviceProp_t properties{};
+    check_gfx1151(exact_output, "PISA spatial fused epilogue", properties);
+    const int64_t grid_blocks = copy_grid_blocks(batch_heads, properties, "PISA spatial fused epilogue");
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    auto output = torch::empty({batch, kMaxTokens, heads * kHeadDim}, exact_output.options());
+    check_aligned(output, "fused output");
+    launch_fuse_spatial_epilogue(
+        exact_output,
+        exact_lse,
+        approximate_output,
+        approximate_lse,
+        correction,
+        output,
+        heads,
+        grid_blocks,
+        stream);
+    return output;
 }

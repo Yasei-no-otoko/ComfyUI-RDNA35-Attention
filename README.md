@@ -35,16 +35,16 @@ The production comparison uses `rdna35-pisa-ck` 0.7.0 API 5 on the local PyTorch
 | Spatial self-attention backend | Complete call | Relative speed | Time reduction |
 |---|---:|---:|---:|
 | ComfyUI Flash Attention | 46.411 ms | 1.000x | baseline |
-| RDNA35 PISA CK/Flex | **37.917 ms** | **1.224x faster** | **8.494 ms (18.3%)** |
+| RDNA35 PISA CK/Flex fused | **25.121 ms** | **1.848x faster** | **21.290 ms (45.9%)** |
 
 The end-to-end comparison uses the same resident ComfyUI process after warm-up with Anima INT8_ConvRot, the 1536x1536 Spectrum workflow, 30 sampler steps, and 17 actual model forwards:
 
-| Backend | Sampler | Prompt total | End-to-end gain |
+| Backend | Sampler median | Prompt median | End-to-end gain |
 |---|---:|---:|---:|
-| ComfyUI Flash Attention | 69.12 s | 69.17 s | baseline |
-| RDNA35 PISA CK/Flex | **68.63 s** | **68.68 s** | **0.49 s (0.7%)** |
+| ComfyUI Flash Attention | 76.08 s | 78.54 s | baseline |
+| RDNA35 PISA CK/Flex fused | **65.94 s** | **68.38 s** | **10.16 s prompt (12.9%)** |
 
-The native Q/K/V spatial pack is included in the complete PISA call and measures 2.412 ms, down from 19.54 ms before the shared-memory transpose optimization. The exact Triton kernel remains available as a correctness baseline but is not selected for generation.
+The runtime verifier recorded `24/24` eligible self-attention calls, zero cross-attention calls, and zero fallbacks for one model forward. The table is an ABBA comparison in one resident process (Flash, PISA, PISA, Flash); unlike the superseded 0.7% table, it does not attribute a Flash fallback run to PISA. The native Q/K/V spatial pack is included in the complete call. The fused gfx1151 epilogue combines LSE weighting, FP32 correction, BF16 conversion, and block-major-to-raster output, while the spatial exact FlexAttention tile uses `BLOCK_N=32`.
 
 PISA is approximate and deliberately opt-in. Against Flash Attention, the coherent same-seed output measured SSIM 0.961379 and RGB cosine 0.999484. The spatial path accepts only the validated 23-block sparse profile: 32 became non-finite during 30 steps, 33/36 were non-finite on the first step, and other sparse budgets are not production-validated. The 144-block profile remains available only as the dense SDPA validation path.
 

@@ -6,6 +6,9 @@ from typing import Any, Callable
 
 import torch
 
+from .anima_pisa_integration import install_anima_pisa_attention
+from .pisa_runtime import PISA_RUNTIME_ATTACHMENT, PISARuntimeState
+
 
 LOG_PREFIX = "RDNA35 PISA"
 TOKEN_POLICIES = {
@@ -204,6 +207,25 @@ def patch_model_pisa_attention(
         )
 
     model_clone = model.clone()
+    if hasattr(model_clone, "get_model_object") and hasattr(model_clone, "add_object_patch"):
+        runtime_state = PISARuntimeState(armed=True)
+        model_clone.set_attachments(PISA_RUNTIME_ATTACHMENT, runtime_state)
+        try:
+            patched_blocks = install_anima_pisa_attention(
+                model_clone,
+                native_forward=rdna35_pisa_ck.forward_spatial_bhtd,
+                exact_blocks=exact_blocks,
+                device_index=device_index,
+                runtime_state=runtime_state if verbose_fallbacks else None,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            return model, f"validated Anima direct PISA integration is unavailable ({exc}); model returned unchanged"
+        return model_clone, (
+            f"model-local gfx1151 direct PISA installed on Anima self-attention blocks {start_layer}:28 "
+            f"at T=9216; exact_blocks={exact_blocks}; patched_blocks={patched_blocks}; "
+            f"runtime_accounting={'enabled' if verbose_fallbacks else 'disabled'}"
+        )
+
     transformer_options = model_clone.model_options.setdefault("transformer_options", {})
     previous_override = transformer_options.get("optimized_attention_override")
     transformer_options["optimized_attention_override"] = make_pisa_attention_override(

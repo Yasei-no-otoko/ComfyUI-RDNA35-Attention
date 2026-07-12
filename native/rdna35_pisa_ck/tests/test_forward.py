@@ -196,6 +196,34 @@ class TestForward(unittest.TestCase):
         restored = rdna35_pisa_ck._C.unpack_spatial_output(packed_q, batch, heads)
         torch.testing.assert_close(restored, base.flatten(2), atol=0.0, rtol=0.0)
 
+    def test_spatial_fused_epilogue_matches_merge_and_unpack(self):
+        batch, heads, tokens = 1, 2, rdna35_pisa_ck.SPATIAL_TOKENS
+        batch_heads = batch * heads
+        torch.manual_seed(53)
+        exact = torch.randn((batch_heads, tokens, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+        approximate = torch.randn_like(exact)
+        correction = torch.randn((batch_heads, tokens, HEAD_DIM), device="cuda", dtype=torch.float32)
+        exact_lse = torch.randn((batch_heads, tokens), device="cuda", dtype=torch.float32)
+        approximate_lse = torch.randn_like(exact_lse)
+
+        total_lse = torch.logaddexp(exact_lse, approximate_lse)
+        expected_ordered = (
+            exact.float() * torch.exp(exact_lse - total_lse)[..., None]
+            + (approximate.float() + correction) * torch.exp(approximate_lse - total_lse)[..., None]
+        ).to(torch.bfloat16)
+        expected = rdna35_pisa_ck._C.unpack_spatial_output(expected_ordered, batch, heads)
+        actual = rdna35_pisa_ck._C.fuse_spatial_epilogue(
+            exact,
+            exact_lse,
+            approximate,
+            approximate_lse,
+            correction,
+            batch,
+            heads,
+        )
+
+        torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.0)
+
     def test_spatial_sparse_profile_is_finite_on_current_stream(self):
         batch, heads, tokens = 1, 2, rdna35_pisa_ck.SPATIAL_TOKENS
         current_stream = torch.cuda.current_stream()

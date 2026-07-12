@@ -17,6 +17,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pisa_pack_spatial_qkv(
     torch::Tensor k,
     torch::Tensor v);
 torch::Tensor pisa_unpack_spatial_output(torch::Tensor output, int64_t batch, int64_t heads);
+torch::Tensor pisa_fuse_spatial_epilogue(
+    torch::Tensor exact_output,
+    torch::Tensor exact_lse,
+    torch::Tensor approximate_output,
+    torch::Tensor approximate_lse,
+    torch::Tensor correction,
+    int64_t batch,
+    int64_t heads);
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
@@ -37,6 +45,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
         "unpack_spatial_output",
         &pisa_unpack_spatial_output,
         pybind11::arg("output"),
+        pybind11::arg("batch"),
+        pybind11::arg("heads"));
+    module.def(
+        "fuse_spatial_epilogue",
+        &pisa_fuse_spatial_epilogue,
+        pybind11::arg("exact_output"),
+        pybind11::arg("exact_lse"),
+        pybind11::arg("approximate_output"),
+        pybind11::arg("approximate_lse"),
+        pybind11::arg("correction"),
         pybind11::arg("batch"),
         pybind11::arg("heads"));
     module.def("build_info", []() {

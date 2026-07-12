@@ -56,6 +56,7 @@ _EXACT_KERNEL_OPTIONS = {
     "fwd_num_warps": 4,
     "ROWS_GUARANTEED_SAFE": True,
 }
+_SPATIAL_EXACT_KERNEL_OPTIONS = {**_EXACT_KERNEL_OPTIONS, "fwd_BLOCK_N": 32}
 _TAIL_KERNEL_OPTIONS = {
     "fwd_BLOCK_M": 64,
     "fwd_BLOCK_N": 32,
@@ -122,7 +123,7 @@ def _validate_spatial_bhtd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
         raise ValueError("PISA spatial CK is forward-only.")
 
 
-def _flex_kernels(scale: float):
+def _flex_kernels(scale: float, spatial: bool):
     def exact_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_mask: BlockMask):
         output, auxiliary = flex_attention(
             q[:, None],
@@ -131,7 +132,7 @@ def _flex_kernels(scale: float):
             block_mask=block_mask,
             scale=scale,
             return_aux=AuxRequest(lse=True),
-            kernel_options=_EXACT_KERNEL_OPTIONS,
+            kernel_options=_SPATIAL_EXACT_KERNEL_OPTIONS if spatial else _EXACT_KERNEL_OPTIONS,
         )
         return output[:, 0], auxiliary.lse[:, 0]
 
@@ -167,8 +168,8 @@ def _flex_kernels(scale: float):
 
 @functools.lru_cache(maxsize=16)
 def _compiled_flex_kernels(tokens: int, dtype: torch.dtype, device_index: int, scale: float):
-    del tokens, dtype, device_index
-    exact_attention, approximate_attention = _flex_kernels(scale)
+    del dtype, device_index
+    exact_attention, approximate_attention = _flex_kernels(scale, tokens == SPATIAL_TOKENS)
     return (
         torch.compile(exact_attention, fullgraph=True, dynamic=False),
         torch.compile(approximate_attention, fullgraph=True, dynamic=False),
@@ -229,6 +230,7 @@ def _forward_impl(
     exact_blocks: int,
     scale: float,
     sink_block: int,
+    spatial_shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     tokens = q.shape[1]
     blocks = (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -287,6 +289,17 @@ def _forward_impl(
         compute_q_blocks=False,
     )
     exact_output, exact_lse = exact_attention(q, k, v, block_mask)
+    if spatial_shape is not None and exact_blocks == SPATIAL_SPARSE_EXACT_BLOCKS:
+        batch, heads = spatial_shape
+        return _C.fuse_spatial_epilogue(
+            exact_output,
+            exact_lse,
+            approximate_output,
+            approximate_lse,
+            correction,
+            batch,
+            heads,
+        )
     total_lse = torch.logaddexp(exact_lse, approximate_lse)
     exact_weight = torch.exp(exact_lse - total_lse)
     approximate_weight = torch.exp(approximate_lse - total_lse)
@@ -331,7 +344,17 @@ def _forward_spatial_bhtd_op(
     sink_block: int,
 ) -> torch.Tensor:
     packed_q, packed_k, packed_v = _C.pack_spatial_qkv(q, k, v)
-    output = _forward_impl(packed_q, packed_k, packed_v, exact_blocks, scale, sink_block)
+    output = _forward_impl(
+        packed_q,
+        packed_k,
+        packed_v,
+        exact_blocks,
+        scale,
+        sink_block,
+        spatial_shape=(q.shape[0], q.shape[1]),
+    )
+    if exact_blocks == SPATIAL_SPARSE_EXACT_BLOCKS:
+        return output
     return _C.unpack_spatial_output(output, q.shape[0], q.shape[1])
 
 

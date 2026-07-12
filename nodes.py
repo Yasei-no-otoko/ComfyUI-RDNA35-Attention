@@ -12,6 +12,7 @@ from .rdna35_block_attention.dispatch import fixed_block_attention
 from .rdna35_block_attention.full_attention import full_attention_triton
 from .rdna35_block_attention.pisa_attention import pisa_attention
 from .rdna35_block_attention.pisa_patch import patch_model_pisa_attention
+from .rdna35_block_attention.pisa_runtime import PISA_RUNTIME_ATTACHMENT
 from .rdna35_block_attention.reference import (
     fixed_block_attention_ref,
     fixed_block_attention_sdpa,
@@ -306,6 +307,36 @@ class RDNA35PISAAttentionBenchmark:
         ]),)
 
 
+class RDNA35PISARuntimeReport:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",), "latent": ("LATENT",)}}
+
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("latent", "report")
+    FUNCTION = "run"
+    CATEGORY = "RDNA35/Attention Research"
+    OUTPUT_NODE = True
+    EXPERIMENTAL = True
+
+    def run(self, model, latent):
+        state = model.get_attachment(PISA_RUNTIME_ATTACHMENT)
+        if state is None:
+            raise RuntimeError("RDNA35 PISA runtime state is not attached to this MODEL")
+        hits = sum(state.per_layer_hits.values())
+        if hits == 0:
+            raise RuntimeError("INVALID BENCHMARK: PISA backend was not executed")
+        counts = set(state.per_layer_hits.values())
+        if set(state.per_layer_hits) != set(range(4, 28)) or len(counts) != 1:
+            raise RuntimeError(f"Incomplete PISA layer accounting: {state.report()}")
+        forwards = counts.pop()
+        state.verify(forwards)
+        if not state.verified:
+            raise RuntimeError(f"PISA runtime verification failed: {state.report()}")
+        report = state.report()
+        return {"ui": {"text": [report]}, "result": (latent, report)}
+
+
 NODE_CLASS_MAPPINGS: dict[str, Any] = {
     "RDNA35BlockAttentionDiagnostics": RDNA35BlockAttentionDiagnostics,
     "RDNA35PatchModelAttention": RDNA35PatchModelAttention,
@@ -313,6 +344,7 @@ NODE_CLASS_MAPPINGS: dict[str, Any] = {
     "RDNA35FixedBlockAttentionBenchmark": RDNA35FixedBlockAttentionBenchmark,
     "RDNA35FullAttentionBenchmark": RDNA35FullAttentionBenchmark,
     "RDNA35PISAAttentionBenchmark": RDNA35PISAAttentionBenchmark,
+    "RDNA35PISARuntimeReport": RDNA35PISARuntimeReport,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -322,4 +354,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RDNA35FixedBlockAttentionBenchmark": "RDNA35 Fixed Block Attention Benchmark",
     "RDNA35FullAttentionBenchmark": "RDNA35 Exact Full Attention Benchmark",
     "RDNA35PISAAttentionBenchmark": "RDNA35 PISA Attention Benchmark",
+    "RDNA35PISARuntimeReport": "RDNA35 PISA Runtime Report",
 }
