@@ -91,7 +91,7 @@ class PISAPatchTests(unittest.TestCase):
         self.assertIs(model.model_options["transformer_options"]["optimized_attention_override"], previous)
         self.assertIsNot(patched.model_options["transformer_options"]["optimized_attention_override"], previous)
 
-    def test_patch_rejects_unvalidated_sparse_budget(self):
+    def test_generic_patch_accepts_non_anima_sparse_budget(self):
         model = DummyModel()
         ck_module = Mock()
         ck_module.build_info.return_value = {"api": 5}
@@ -106,8 +106,8 @@ class PISAPatchTests(unittest.TestCase):
                 verbose_fallbacks=False,
             )
 
-        self.assertIs(patched, model)
-        self.assertIn("selects 36 blocks", info)
+        self.assertIsNot(patched, model)
+        self.assertIn("generic gfx1151 PISA", info)
 
     def test_explicit_self_attention_marker_is_required(self):
         q = _tensor(value=1.0)

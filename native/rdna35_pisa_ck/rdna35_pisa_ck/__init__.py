@@ -223,6 +223,36 @@ def _block_stats_op_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> t
     return q.new_empty(shape), q.new_empty(shape, dtype=torch.float32), q.new_empty(shape)
 
 
+@torch.library.custom_op("rdna35_pisa_ck::block_stats_hyd", mutates_args=(), device_types="cuda")
+def _block_stats_hyd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _C.block_stats_hyd(q, k, v)
+
+
+@_block_stats_hyd_op.register_fake
+def _block_stats_hyd_op_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del k, v
+    blocks = (q.shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
+    shape = (q.shape[0], blocks, q.shape[2])
+    return q.new_empty(shape), q.new_empty(shape, dtype=torch.float32), q.new_empty(shape), q.new_empty((q.shape[0], q.shape[2], q.shape[2]), dtype=torch.float32)
+
+
+def block_stats_hyd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_runtime_abi()
+    if q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("PISA CK HYD expects matching [BH,T,D] q/k/v tensors.")
+    if q.shape[0] <= 0 or q.shape[1] <= 0 or q.shape[1] > MAX_TOKENS or q.shape[2] <= 0 or q.shape[2] > 256:
+        raise ValueError("PISA CK HYD requires BH>0, 0<T<=9216, and 0<D<=256.")
+    if q.device != k.device or q.device != v.device or q.device.type != "cuda" or torch.version.hip is None:
+        raise ValueError("PISA CK HYD requires q/k/v on one PyTorch ROCm device.")
+    if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("PISA CK HYD requires matching fp16/bf16 q/k/v.")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("PISA CK HYD requires contiguous q/k/v.")
+    if q.requires_grad or k.requires_grad or v.requires_grad:
+        raise ValueError("PISA CK HYD is forward-only.")
+    return _block_stats_hyd_op(q, k, v)
+
+
 def _forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -461,6 +491,8 @@ def capabilities() -> dict[str, object]:
         "spatial_bhtd": True,
         "spatial_tokens": SPATIAL_TOKENS,
         "spatial_sparse_exact_blocks": (SPATIAL_SPARSE_EXACT_BLOCKS,),
+        "hyd_stats_head_dims": (128,),
+        "hyd_stats_dtypes": (torch.bfloat16,),
     }
 
 
@@ -476,6 +508,7 @@ __all__ = [
     "SPATIAL_SPARSE_EXACT_BLOCKS",
     "SPATIAL_TOKENS",
     "build_info",
+    "block_stats_hyd",
     "capabilities",
     "clear_compile_cache",
     "forward",

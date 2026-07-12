@@ -7,6 +7,7 @@ from typing import Any, Callable
 import torch
 
 from .anima_pisa_integration import install_anima_pisa_attention, validate_anima_pisa_model
+from .generic_pisa import make_generic_pisa_override
 from .pisa_runtime import PISA_RUNTIME_ATTACHMENT, PISARuntimeState
 
 
@@ -179,8 +180,6 @@ def patch_model_pisa_attention(
         return model, f"invalid exact_budget={exact_budget}; model returned unchanged"
     if token_policy not in TOKEN_POLICIES:
         return model, f"unsupported token_policy={token_policy}; model returned unchanged"
-    if start_layer != 4:
-        return model, f"only the validated Anima start_layer=4 is supported, got {start_layer}; model returned unchanged"
     if not hasattr(model, "clone") or not hasattr(model, "model_options"):
         return model, "MODEL does not expose ComfyUI ModelPatcher clone/model_options; model returned unchanged"
 
@@ -188,11 +187,31 @@ def patch_model_pisa_attention(
     if device_index is None:
         return model, f"{device_error}; model returned unchanged"
 
+    is_anima = False
     if hasattr(model, "get_model_object") and hasattr(model, "add_object_patch"):
         try:
             validate_anima_pisa_model(model)
-        except (AttributeError, TypeError, ValueError) as exc:
-            return model, f"validated Anima direct PISA integration is unavailable ({exc}); model returned unchanged"
+            is_anima = True
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    if not is_anima:
+        model_clone = model.clone()
+        runtime_state = PISARuntimeState(armed=True)
+        if hasattr(model_clone, "set_attachments"):
+            model_clone.set_attachments(PISA_RUNTIME_ATTACHMENT, runtime_state)
+        transformer_options = model_clone.model_options.setdefault("transformer_options", {})
+        previous_override = transformer_options.get("optimized_attention_override")
+        transformer_options["optimized_attention_override"] = make_generic_pisa_override(
+            exact_budget=exact_budget,
+            device_index=device_index,
+            previous_override=previous_override,
+            runtime_state=runtime_state,
+        )
+        info = "model-local generic gfx1151 PISA installed for explicit self-attention with T>=2048 and arbitrary head dimension"
+        if previous_override is not None:
+            info += "; existing optimized_attention_override is chained for fallback"
+        return model_clone, info
 
     try:
         import rdna35_pisa_ck

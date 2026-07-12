@@ -326,6 +326,10 @@ class RDNA35PISARuntimeReport:
         hits = sum(state.per_layer_hits.values())
         if hits == 0:
             raise RuntimeError("INVALID BENCHMARK: PISA backend was not executed")
+        if set(state.per_layer_hits) == {-1}:
+            if state.failed:
+                raise RuntimeError(f"Generic PISA runtime failed: {state.report()}")
+            return {"ui": {"text": [state.report()]}, "result": (latent, state.report())}
         counts = set(state.per_layer_hits.values())
         if set(state.per_layer_hits) != set(range(4, 28)) or len(counts) != 1:
             raise RuntimeError(f"Incomplete PISA layer accounting: {state.report()}")
@@ -350,7 +354,7 @@ NODE_CLASS_MAPPINGS: dict[str, Any] = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RDNA35BlockAttentionDiagnostics": "RDNA35 Block Attention Diagnostics",
     "RDNA35PatchModelAttention": "RDNA35 Patch Model Attention",
-    "RDNA35PatchAnimaPISAAttention": "RDNA35 Patch Anima PISA Attention",
+    "RDNA35PatchAnimaPISAAttention": "RDNA35 Patch PISA Attention",
     "RDNA35FixedBlockAttentionBenchmark": "RDNA35 Fixed Block Attention Benchmark",
     "RDNA35FullAttentionBenchmark": "RDNA35 Exact Full Attention Benchmark",
     "RDNA35PISAAttentionBenchmark": "RDNA35 PISA Attention Benchmark",

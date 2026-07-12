@@ -23,7 +23,7 @@ The Triton path is forward/inference only. There is no custom autograd or backwa
 
 - `RDNA35 Block Attention Diagnostics`: reports PyTorch, HIP, device, best-effort gfx target, Triton availability, and RDNA3.5 detection.
 - `RDNA35 Patch Model Attention`: installs a model-local `optimized_attention_override` on a cloned MODEL. It never globally monkey-patches ComfyUI attention.
-- `RDNA35 Patch Anima PISA Attention`: installs the model-local PISA override. It accepts only explicitly marked BF16 self-attention at `T=9216`, keeps the first four Anima blocks on the existing backend, and applies spatial 8x8 PISA blocks to the remaining 24 self-attention blocks. Cross-attention and other shapes chain to the previous ComfyUI backend.
+- `RDNA35 Patch PISA Attention`: installs a model-local PISA override. Anima keeps its validated `T=9216,D=128` spatial path. Explicitly marked SD1.5, SDXL, Wan, and LTX self-attention with `T>=2048` uses the generic path; cross-attention, masks, short sequences, and unsupported devices chain to the previous ComfyUI backend.
 - `RDNA35 Fixed Block Attention Benchmark`: creates synthetic Q/K/V tensors, compares reference, dispatch, PyTorch SDPA with a block-diagonal mask, and normal PyTorch full SDPA. Full SDPA is reported as a semantic contrast, not as an exact replacement.
 - `RDNA35 Exact Full Attention Benchmark`: compares the gfx1151 online-softmax kernel with PyTorch SDPA for Anima-like self- and cross-attention shapes.
 - `RDNA35 PISA Attention Benchmark`: separates first-use compile time from GPU-event steady-state time and compares the CK/Flex hybrid with dense SDPA.
@@ -114,8 +114,9 @@ Otherwise dispatch falls back to the PyTorch reference implementation with a rea
 ## Limitations
 
 - Forward/inference only
-- CK/Flex PISA is BF16-only and gfx1151-only
-- PISA model dispatch supports only Anima `T=9216`; other token counts stay on Flash
+- The optimized PISA paths are gfx1151-only
+- Generic PISA prioritizes the fused CK HYD statistics profile for BF16 `D=128`; FP16 and other head dimensions up to 256 use the fused Triton statistics fallback
+- SDXL `T=4032,D=64` execution is verified. Wan and LTX dispatch contracts are wired, but require model-specific quality and performance validation before being called production profiles
 - First use compiles two FlexAttention kernels; benchmark cold and steady-state runs separately
 - PISA output is approximate and can change composition relative to Flash Attention
 - Spatial sparse PISA accepts only the validated 23 exact blocks; other sparse budgets are rejected after real-model non-finite results at 32/33/36

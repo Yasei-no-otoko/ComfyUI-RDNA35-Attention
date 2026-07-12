@@ -55,15 +55,16 @@ def _get_block_stats_kernel():
         h_sum_ptr,
         tokens: tl.constexpr,
         head_dim: tl.constexpr,
+        padded_head_dim: tl.constexpr,
         block_size: tl.constexpr,
     ):
         block = tl.program_id(0)
         bh = tl.program_id(1)
         rows = tl.arange(0, block_size)
-        dims = tl.arange(0, head_dim)
+        dims = tl.arange(0, padded_head_dim)
         token_offsets = block * block_size + rows
         offsets = bh * tokens * head_dim + token_offsets[:, None] * head_dim + dims[None, :]
-        valid = token_offsets[:, None] < tokens
+        valid = (token_offsets[:, None] < tokens) & (dims[None, :] < head_dim)
         k = tl.load(k_ptr + offsets, mask=valid, other=0.0)
         v = tl.load(v_ptr + offsets, mask=valid, other=0.0)
         length = tl.minimum(block_size, tokens - block * block_size).to(tl.float32)
@@ -72,14 +73,15 @@ def _get_block_stats_kernel():
 
         total_blocks = (tokens + block_size - 1) // block_size
         stat_offsets = bh * total_blocks * head_dim + block * head_dim + dims
-        tl.store(k_mean_ptr + stat_offsets, k_mean)
-        tl.store(v_sum_ptr + stat_offsets, v_sum)
+        tl.store(k_mean_ptr + stat_offsets, k_mean, mask=dims < head_dim)
+        tl.store(v_sum_ptr + stat_offsets, v_sum, mask=dims < head_dim)
 
         # Triton dot operands must match; the matrix product still accumulates in fp32.
         centered = (k - k_mean[None, :]).to(v.dtype)
         h_block = tl.dot(tl.trans(centered), v, input_precision="ieee")
         h_offsets = bh * head_dim * head_dim + dims[:, None] * head_dim + dims[None, :]
-        tl.atomic_add(h_sum_ptr + h_offsets, h_block)
+        h_valid = (dims[:, None] < head_dim) & (dims[None, :] < head_dim)
+        tl.atomic_add(h_sum_ptr + h_offsets, h_block, mask=h_valid)
 
     _BLOCK_STATS_KERNEL = _pisa_block_stats_kernel
     return triton, _BLOCK_STATS_KERNEL
@@ -93,8 +95,8 @@ def pisa_prepare_triton(k: torch.Tensor, v: torch.Tensor, *, block_size: int = 6
     """
     if k.ndim != 3 or k.shape != v.shape:
         raise ValueError("PISA Triton preparation expects matching [BH,T,D] k/v.")
-    if block_size != 64 or k.shape[-1] != 128:
-        raise ValueError("PISA Triton preparation requires block_size=64 and D=128.")
+    if block_size != 64:
+        raise ValueError("PISA Triton preparation requires block_size=64.")
     if k.dtype not in (torch.float16, torch.bfloat16) or v.dtype != k.dtype:
         raise ValueError("PISA Triton preparation requires matching fp16/bf16 k/v.")
     if not k.is_cuda or not v.is_cuda:
@@ -102,12 +104,15 @@ def pisa_prepare_triton(k: torch.Tensor, v: torch.Tensor, *, block_size: int = 6
     if not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("PISA Triton preparation requires contiguous k/v.")
 
+    triton, kernel = _get_block_stats_kernel()
     batch_heads, tokens, head_dim = k.shape
+    padded_head_dim = triton.next_power_of_2(head_dim)
+    if padded_head_dim > 256:
+        raise ValueError(f"PISA Triton preparation requires D<=256, got D={head_dim}.")
     total_blocks = math.ceil(tokens / block_size)
     k_means = torch.empty((batch_heads, total_blocks, head_dim), device=k.device, dtype=torch.float32)
     v_sums = torch.empty_like(k_means)
     h_sum = torch.zeros((batch_heads, head_dim, head_dim), device=k.device, dtype=torch.float32)
-    triton, kernel = _get_block_stats_kernel()
     kernel[(total_blocks, batch_heads)](
         k,
         v,
@@ -116,6 +121,7 @@ def pisa_prepare_triton(k: torch.Tensor, v: torch.Tensor, *, block_size: int = 6
         h_sum,
         tokens,
         head_dim,
+        padded_head_dim,
         block_size,
         num_warps=4,
         num_stages=1,

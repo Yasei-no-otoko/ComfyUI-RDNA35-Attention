@@ -12,6 +12,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats_hyd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pisa_pack_spatial_qkv(
     torch::Tensor q,
     torch::Tensor k,
@@ -32,6 +36,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
     module.def(
         "block_stats",
         &pisa_block_stats,
+        pybind11::arg("q"),
+        pybind11::arg("k"),
+        pybind11::arg("v"));
+    module.def(
+        "block_stats_hyd",
+        &pisa_block_stats_hyd,
         pybind11::arg("q"),
         pybind11::arg("k"),
         pybind11::arg("v"));

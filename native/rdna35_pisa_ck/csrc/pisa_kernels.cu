@@ -164,6 +164,68 @@ __global__ void block_stats_kernel(
 }
 
 
+template <typename T>
+__global__ void block_stats_hyd_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
+    T* __restrict__ q_centroids,
+    float* __restrict__ k_centroids,
+    T* __restrict__ v_means,
+    float* __restrict__ h_sum,
+    int tokens,
+    int blocks,
+    int head_dim)
+{
+    extern __shared__ float means[];
+    float* q_mean = means;
+    float* k_mean = q_mean + head_dim;
+    float* v_mean = k_mean + head_dim;
+    const int group = blockIdx.x;
+    const int bh = group / blocks;
+    const int sequence_block = group - bh * blocks;
+    const int start = sequence_block * kBlockSize;
+    const int length = min(kBlockSize, tokens - start);
+
+    for(int dim = threadIdx.x; dim < head_dim; dim += blockDim.x)
+    {
+        float q_value = 0.0f;
+        float k_value = 0.0f;
+        float v_value = 0.0f;
+        for(int row = 0; row < length; ++row)
+        {
+            const int64_t offset = (static_cast<int64_t>(bh) * tokens + start + row) * head_dim + dim;
+            q_value += load_float(q, offset);
+            k_value += load_float(k, offset);
+            v_value += load_float(v, offset);
+        }
+        const float inverse_length = 1.0f / static_cast<float>(length);
+        q_mean[dim] = q_value * inverse_length;
+        k_mean[dim] = k_value * inverse_length;
+        v_mean[dim] = v_value * inverse_length;
+        const int64_t output = (static_cast<int64_t>(bh) * blocks + sequence_block) * head_dim + dim;
+        q_centroids[output] = ck_tile::type_convert<T>(q_mean[dim]);
+        k_centroids[output] = k_mean[dim];
+        v_means[output] = ck_tile::type_convert<T>(v_mean[dim]);
+    }
+    __syncthreads();
+
+    const int elements = head_dim * head_dim;
+    for(int element = threadIdx.x; element < elements; element += blockDim.x)
+    {
+        const int row_dim = element / head_dim;
+        const int column_dim = element - row_dim * head_dim;
+        float value = 0.0f;
+        for(int row = 0; row < length; ++row)
+        {
+            const int64_t base = (static_cast<int64_t>(bh) * tokens + start + row) * head_dim;
+            value += (load_float(k, base + row_dim) - k_mean[row_dim]) * load_float(v, base + column_dim);
+        }
+        atomicAdd(h_sum + (static_cast<int64_t>(bh) * head_dim + row_dim) * head_dim + column_dim, value);
+    }
+}
+
+
 __global__ void pack_spatial_qkv_kernel(
     const ck_tile::bf16_t* __restrict__ q,
     const ck_tile::bf16_t* __restrict__ k,
@@ -365,6 +427,41 @@ void launch_block_stats(
 }
 
 
+template <typename T>
+void launch_block_stats_hyd(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    torch::Tensor& q_centroids,
+    torch::Tensor& k_centroids,
+    torch::Tensor& v_means,
+    torch::Tensor& h_sum,
+    int tokens,
+    int blocks,
+    int head_dim,
+    hipStream_t stream)
+{
+    const int batch_heads = static_cast<int>(q.size(0));
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(block_stats_hyd_kernel<T>),
+        dim3(batch_heads * blocks),
+        dim3(256),
+        static_cast<std::size_t>(3 * head_dim) * sizeof(float),
+        stream,
+        reinterpret_cast<const T*>(q.data_ptr()),
+        reinterpret_cast<const T*>(k.data_ptr()),
+        reinterpret_cast<const T*>(v.data_ptr()),
+        reinterpret_cast<T*>(q_centroids.data_ptr()),
+        k_centroids.data_ptr<float>(),
+        reinterpret_cast<T*>(v_means.data_ptr()),
+        h_sum.data_ptr<float>(),
+        tokens,
+        blocks,
+        head_dim);
+    check_launch();
+}
+
+
 void launch_pack_spatial_qkv(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -474,6 +571,46 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats(
     launch_block_stats<ck_tile::bf16_t>(q, k, v, q_centroids, k_centroids, v_means, tokens, blocks, stream);
 
     return {q_centroids, k_centroids, v_means};
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats_hyd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v)
+{
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "PISA CK HYD statistics require HIP device tensors.");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "q, k, and v must be on the same device.");
+    TORCH_CHECK(q.dim() == 3 && q.sizes() == k.sizes() && q.sizes() == v.sizes(), "PISA CK HYD expects matching [BH,T,D] q/k/v.");
+    TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0 && q.size(2) <= 256, "PISA CK HYD requires BH>0, T>0, and 0<D<=256.");
+    TORCH_CHECK(q.size(1) <= kMaxTokens, "PISA CK HYD supports T<=9216.");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "PISA CK HYD requires contiguous q/k/v.");
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(), "q, k, and v must have the same dtype.");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kHalf, "PISA CK HYD supports bfloat16 and float16.");
+    TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad(), "PISA CK HYD is forward-only.");
+
+    const int tokens = static_cast<int>(q.size(1));
+    const int head_dim = static_cast<int>(q.size(2));
+    const int blocks = (tokens + kBlockSize - 1) / kBlockSize;
+    hipDeviceProp_t properties{};
+    check_gfx1151(q, "PISA CK HYD statistics", properties);
+    TORCH_CHECK(q.size(0) <= std::numeric_limits<int>::max() / blocks, "PISA CK HYD grid size overflow.");
+    TORCH_CHECK(q.size(0) * blocks <= properties.maxGridSize[0], "PISA CK HYD input is too large for the gfx1151 launch grid.");
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    auto q_centroids = torch::empty({q.size(0), blocks, head_dim}, q.options());
+    auto k_centroids = torch::empty({q.size(0), blocks, head_dim}, q.options().dtype(torch::kFloat32));
+    auto v_means = torch::empty_like(q_centroids);
+    auto h_sum = torch::zeros({q.size(0), head_dim, head_dim}, q.options().dtype(torch::kFloat32));
+    if(q.scalar_type() == at::kBFloat16)
+    {
+        launch_block_stats_hyd<ck_tile::bf16_t>(q, k, v, q_centroids, k_centroids, v_means, h_sum, tokens, blocks, head_dim, stream);
+    }
+    else
+    {
+        launch_block_stats_hyd<ck_tile::half_t>(q, k, v, q_centroids, k_centroids, v_means, h_sum, tokens, blocks, head_dim, stream);
+    }
+    return {q_centroids, k_centroids, v_means, h_sum};
 }
 
 
