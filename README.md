@@ -57,6 +57,8 @@ The generic benchmark below uses identical synthetic Q/K/V tensors and GPU-event
 
 On the same inputs, Sage had cosine similarity 0.999933 and 0.999922 against dense SDPA. Generic PISA is intentionally approximate; its corresponding cosine values were 0.816255 and 0.812640 on random tensors, so its speed result must be paired with model-level quality validation before enabling a new profile. Five additional Sage-only rounds gave stable medians of 5.869 ms and 21.741 ms for the two rows.
 
+An LTX 2.3 image-to-video run at 768x768, 73 frames, and batch 2 completed normally but did not execute PISA. Runtime accounting observed 768 self-attention and 1536 cross-attention calls; the relevant self-attention sequence was `T=1440`, below the generic `T>=8192` threshold, while text attention used `T=77`. Those calls correctly remained on the existing ComfyUI backend. This is compatibility evidence, not an LTX PISA speed result.
+
 PISA is approximate and deliberately opt-in. Against Flash Attention, the coherent same-seed output measured SSIM 0.961379 and RGB cosine 0.999484. The spatial path accepts only the validated 23-block sparse profile: 32 became non-finite during 30 steps, 33/36 were non-finite on the first step, and other sparse budgets are not production-validated. The 144-block profile remains available only as the dense SDPA validation path.
 
 ## Install
@@ -134,7 +136,7 @@ Otherwise dispatch falls back to the PyTorch reference implementation with a rea
 - The optimized PISA paths are gfx1151-only
 - Generic PISA prioritizes the fused CK HYD statistics profile for BF16 `D=128`; FP16 and other head dimensions up to 256 use the fused Triton statistics fallback
 - SD1.5/SDXL, Wan, Wan AR, and LTX use generic PISA only for explicitly marked, unmasked self-attention with matching Q/K/V and `T>=8192`. Cross-attention, GQA, short sequences, Wan KV-cache attention, and LTX guide masks chain to the previous ComfyUI backend
-- SDXL `T=4032,D=64` fallback execution is verified. Wan and LTX dispatch contracts are covered by integration tests, but require model-specific output quality and performance validation before being called production profiles
+- SDXL `T=4032,D=64` fallback execution is verified. Wan dispatch is covered by synthetic contract tests. LTX 2.3 is verified to complete an actual 768x768, 73-frame workflow with safe short-sequence fallback, but neither model has a production PISA quality/performance profile
 - A generic CK/Triton/Flex compile failure falls back to the previous attention backend; an out-of-memory error remains fatal so a second large allocation is not attempted
 - First use compiles two FlexAttention kernels; benchmark cold and steady-state runs separately
 - PISA output is approximate and can change composition relative to Flash Attention
