@@ -59,6 +59,8 @@ On the same inputs, Sage had cosine similarity 0.999933 and 0.999922 against den
 
 An LTX 2.3 image-to-video run at 768x768, 73 frames, and batch 2 completed normally but did not execute PISA. Runtime accounting observed 768 self-attention and 1536 cross-attention calls; the relevant self-attention sequence was `T=1440`, below the generic `T>=8192` threshold, while text attention used `T=77`. Those calls correctly remained on the existing ComfyUI backend. This is compatibility evidence, not an LTX PISA speed result.
 
+The generic Triton HYD path was also checked for batch isolation with FP16 `B=4,H=8,T=8192,D=64`. All outputs were finite, and batch 0 from the four-image call matched the same input executed alone with MAE `5.38e-9` and maximum absolute error `6.10e-5`.
+
 PISA is approximate and deliberately opt-in. Against Flash Attention, the coherent same-seed output measured SSIM 0.961379 and RGB cosine 0.999484. The spatial path accepts only the validated 23-block sparse profile: 32 became non-finite during 30 steps, 33/36 were non-finite on the first step, and other sparse budgets are not production-validated. The 144-block profile remains available only as the dense SDPA validation path.
 
 ## Install
