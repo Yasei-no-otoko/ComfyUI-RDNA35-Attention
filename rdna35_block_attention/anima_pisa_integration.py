@@ -17,6 +17,20 @@ def _record(runtime_state: Any | None, **kwargs) -> None:
         runtime_state.record(**kwargs)
 
 
+def validate_anima_pisa_model(model_patcher) -> None:
+    diffusion_model = model_patcher.get_model_object("diffusion_model")
+    blocks = getattr(diffusion_model, "blocks", None)
+    if blocks is None or len(blocks) != ANIMA_BLOCK_COUNT:
+        raise ValueError(f"validated Anima model requires {ANIMA_BLOCK_COUNT} blocks")
+
+    for index, block in enumerate(blocks):
+        self_attn = getattr(block, "self_attn", None)
+        if self_attn is None:
+            raise ValueError(f"Anima block {index} has no self_attn")
+        if getattr(self_attn, "n_heads", None) != ANIMA_PISA_HEADS or getattr(self_attn, "head_dim", None) != ANIMA_PISA_HEAD_DIM:
+            raise ValueError(f"Anima block {index} is not the validated H=16 D=128 attention profile")
+
+
 def _runtime_shape(q: torch.Tensor) -> tuple[int, int, int, int]:
     return q.shape[0], q.shape[2], q.shape[1], q.shape[3]
 
@@ -88,17 +102,9 @@ def install_anima_pisa_attention(
     device_index: int,
     runtime_state: Any | None = None,
 ) -> int:
+    validate_anima_pisa_model(model_patcher)
     diffusion_model = model_patcher.get_model_object("diffusion_model")
-    blocks = getattr(diffusion_model, "blocks", None)
-    if blocks is None or len(blocks) != ANIMA_BLOCK_COUNT:
-        raise ValueError(f"validated Anima model requires {ANIMA_BLOCK_COUNT} blocks")
-
-    for index, block in enumerate(blocks):
-        self_attn = getattr(block, "self_attn", None)
-        if self_attn is None:
-            raise ValueError(f"Anima block {index} has no self_attn")
-        if getattr(self_attn, "n_heads", None) != ANIMA_PISA_HEADS or getattr(self_attn, "head_dim", None) != ANIMA_PISA_HEAD_DIM:
-            raise ValueError(f"Anima block {index} is not the validated H=16 D=128 attention profile")
+    blocks = diffusion_model.blocks
 
     for index in range(ANIMA_PISA_START_LAYER, ANIMA_BLOCK_COUNT):
         self_attn = blocks[index].self_attn

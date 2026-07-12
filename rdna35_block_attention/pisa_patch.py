@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import torch
 
-from .anima_pisa_integration import install_anima_pisa_attention
+from .anima_pisa_integration import install_anima_pisa_attention, validate_anima_pisa_model
 from .pisa_runtime import PISA_RUNTIME_ATTACHMENT, PISARuntimeState
 
 
@@ -187,6 +187,12 @@ def patch_model_pisa_attention(
     device_index, device_error = _gfx1151_device_index()
     if device_index is None:
         return model, f"{device_error}; model returned unchanged"
+
+    if hasattr(model, "get_model_object") and hasattr(model, "add_object_patch"):
+        try:
+            validate_anima_pisa_model(model)
+        except (AttributeError, TypeError, ValueError) as exc:
+            return model, f"validated Anima direct PISA integration is unavailable ({exc}); model returned unchanged"
 
     try:
         import rdna35_pisa_ck
