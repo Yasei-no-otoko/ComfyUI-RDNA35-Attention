@@ -99,8 +99,8 @@ native extensionは事前build済みですが、FlexAttentionは最初のshape/d
 
 ```powershell
 Set-Location C:\ComfyUI
-python -m unittest discover -s custom_nodes\ComfyUI-RDNA35-FixedBlockAttention\native\rdna35_pisa_ck\tests -v
-python -m unittest discover -s custom_nodes\ComfyUI-RDNA35-FixedBlockAttention\tests -v
+python -m unittest discover -s custom_nodes\ComfyUI-RDNA35-Attention\native\rdna35_pisa_ck\tests -v
+python -m unittest discover -s custom_nodes\ComfyUI-RDNA35-Attention\tests -v
 ```
 
 0.7.0ではnative 11件、custom-node 35件がgfx1151環境で合格しています。
