@@ -24,6 +24,24 @@ def _unpack_spatial_blocks(tensor: torch.Tensor, side: int) -> torch.Tensor:
     return tensor.reshape(tensor.shape[0], tensor.shape[1], grid, grid, SPATIAL_BLOCK_EDGE, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
 
 
+def _pack_video_blocks(tensor: torch.Tensor, grid_sizes: tuple[int, int, int]) -> torch.Tensor:
+    frames, height, width = grid_sizes
+    batch, heads, tokens, head_dim = tensor.shape
+    if height != width or tokens != frames * height * width:
+        raise ValueError("video token shape does not match a square spatial grid")
+    per_frame = tensor.unflatten(2, (frames, height * width)).transpose(1, 2).flatten(0, 1)
+    return _pack_spatial_blocks(per_frame, height).unflatten(0, (batch, frames)).transpose(1, 2).flatten(2, 3)
+
+
+def _unpack_video_blocks(tensor: torch.Tensor, grid_sizes: tuple[int, int, int]) -> torch.Tensor:
+    frames, height, width = grid_sizes
+    batch, heads, tokens, head_dim = tensor.shape
+    if height != width or tokens != frames * height * width:
+        raise ValueError("video token shape does not match a square spatial grid")
+    per_frame = tensor.unflatten(2, (frames, height * width)).transpose(1, 2).flatten(0, 1)
+    return _unpack_spatial_blocks(per_frame, height).unflatten(0, (batch, frames)).transpose(1, 2).flatten(2, 3)
+
+
 def _flex_kernels(scale: float):
     exact_options = {
         "fwd_BLOCK_M": 64,
@@ -225,6 +243,8 @@ def make_generic_pisa_override(
         reason = None
         if kwargs.get("is_self_attention") is not True:
             reason = "not_explicit_self_attention"
+        elif kwargs.get("is_kv_cached_attention", False):
+            reason = "kv_cached_attention_is_not_supported"
         elif mask is not None:
             reason = "attention_mask_is_not_supported"
         elif kwargs.get("enable_gqa", False):
@@ -267,6 +287,16 @@ def make_generic_pisa_override(
             runtime_state.record(is_self_attention=kwargs.get("is_self_attention"), shape=shape, fallback_reason=reason, context=context)
             return fallback(original_func, q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
 
+        grid_sizes = transformer_options.get("grid_sizes")
+        video_layout = (
+            isinstance(grid_sizes, (tuple, list))
+            and len(grid_sizes) == 3
+            and all(isinstance(value, int) and value > 0 for value in grid_sizes)
+            and math.prod(grid_sizes) == tokens
+            and grid_sizes[1] == grid_sizes[2]
+            and grid_sizes[1] % SPATIAL_BLOCK_EDGE == 0
+        )
+        video_grid = tuple(grid_sizes) if video_layout else None
         side = math.isqrt(tokens)
         spatial_layout = side * side == tokens and side % SPATIAL_BLOCK_EDGE == 0
         if spatial_layout and isinstance(block, (tuple, list)) and block[0] == "input":
@@ -284,7 +314,9 @@ def make_generic_pisa_override(
                 skip_output_reshape=skip_output_reshape,
                 **kwargs,
             )
-        if spatial_layout:
+        if video_grid is not None:
+            q_bhtd, k_bhtd, v_bhtd = (_pack_video_blocks(tensor, video_grid) for tensor in (q_bhtd, k_bhtd, v_bhtd))
+        elif spatial_layout:
             q_bhtd, k_bhtd, v_bhtd = (_pack_spatial_blocks(tensor, side) for tensor in (q_bhtd, k_bhtd, v_bhtd))
         q_flat, k_flat, v_flat = (tensor.contiguous().flatten(0, 1) for tensor in (q_bhtd, k_bhtd, v_bhtd))
         use_first_order = head_dim == 128 and q.dtype == torch.bfloat16
@@ -338,7 +370,9 @@ def make_generic_pisa_override(
             quality = f"cos={cosine:.6f},mae={mae:.6g},pisa_max={output_float.abs().max().item():.6g},sdpa_max={reference_float.abs().max().item():.6g}"
         runtime_state.record(layer=-1, is_self_attention=True, shape=(batch, heads, tokens, head_dim), backend=backend, context=context, quality=quality)
         output = output.unflatten(0, (batch, heads))
-        if spatial_layout:
+        if video_grid is not None:
+            output = _unpack_video_blocks(output, video_grid)
+        elif spatial_layout:
             output = _unpack_spatial_blocks(output, side)
         if skip_output_reshape:
             return output
