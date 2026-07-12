@@ -28,17 +28,23 @@ The Triton path is forward/inference only. There is no custom autograd or backwa
 
 ## Measured gfx1151 results
 
-On the local PyTorch 2.14 ROCm 7.15 stack with BF16 and `B=2,H=16,D=128`:
+The production comparison uses `rdna35-pisa-ck` 0.7.0 API 5 on the local PyTorch 2.14 ROCm 7.15 stack. The attention measurement is BF16 `B=2,H=16,T=9216,D=128` with the validated 23/144 exact-block profile:
 
-| Shape | Flash Attention | Exact Triton | Ratio |
+| Spatial self-attention backend | Complete call | Relative speed | Time reduction |
 |---|---:|---:|---:|
-| Q=4096, K=4096 | 9.376 ms | 18.138 ms | 1.935x slower |
-| Q=4096, K=512 | 1.763 ms | 2.445 ms | 1.387x slower |
-| Q=9216, K=9216 | 48.137 ms | 90.257 ms | 1.875x slower |
+| ComfyUI Flash Attention | 46.411 ms | 1.000x | baseline |
+| RDNA35 PISA CK/Flex | **37.917 ms** | **1.224x faster** | **8.494 ms (18.3%)** |
 
-The exact Triton kernel is retained as a correctness baseline but is not selected for generation. With `rdna35-pisa-ck` 0.7.0 API 5, BF16 `B=2,H=16,T=9216,D=128`, and 23/144 exact blocks, the complete spatial PISA call measured 37.917 ms versus 46.411 ms for ComfyUI Flash Attention. The native Q/K/V spatial pack measured 2.412 ms, down from 19.54 ms before the shared-memory transpose.
+The end-to-end comparison uses the same resident ComfyUI process after warm-up with Anima INT8_ConvRot, the 1536x1536 Spectrum workflow, 30 sampler steps, and 17 actual model forwards:
 
-After warm-up in the same resident ComfyUI process, an Anima INT8_ConvRot 1536x1536 Spectrum 30-step run with 17 actual forwards measured 69.12 s Sampler / 69.17 s Prompt total on Flash and 68.63 s / 68.68 s on `rdna35-pisa-ck` 0.7.0 API 5. PISA reduced both by 0.49 s (0.7%). PISA is approximate and deliberately opt-in: the coherent same-seed image had SSIM 0.961379 and RGB cosine 0.999484 against Flash. The spatial path accepts only the validated 23-block sparse profile: 32 became non-finite during 30 steps, 33/36 were non-finite on the first step, and other sparse budgets are not production-validated. 144 blocks remains available only as the dense SDPA validation path.
+| Backend | Sampler | Prompt total | End-to-end gain |
+|---|---:|---:|---:|
+| ComfyUI Flash Attention | 69.12 s | 69.17 s | baseline |
+| RDNA35 PISA CK/Flex | **68.63 s** | **68.68 s** | **0.49 s (0.7%)** |
+
+The native Q/K/V spatial pack is included in the complete PISA call and measures 2.412 ms, down from 19.54 ms before the shared-memory transpose optimization. The exact Triton kernel remains available as a correctness baseline but is not selected for generation.
+
+PISA is approximate and deliberately opt-in. Against Flash Attention, the coherent same-seed output measured SSIM 0.961379 and RGB cosine 0.999484. The spatial path accepts only the validated 23-block sparse profile: 32 became non-finite during 30 steps, 33/36 were non-finite on the first step, and other sparse budgets are not production-validated. The 144-block profile remains available only as the dense SDPA validation path.
 
 ## Install
 
