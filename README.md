@@ -1,5 +1,7 @@
 # ComfyUI RDNA35 Attention Research
 
+![ComfyUI RDNA35 Attention](assets/rdna35-attention.png)
+
 **English documentation (canonical).**
 
 [日本語版](README_JA.md)
