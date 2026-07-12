@@ -203,10 +203,14 @@ def make_generic_pisa_override(
             reason = "not_explicit_self_attention"
         elif mask is not None:
             reason = "attention_mask_is_not_supported"
+        elif kwargs.get("enable_gqa", False):
+            reason = "gqa_is_not_supported"
         elif not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v)):
             reason = "qkv_are_not_tensors"
         elif q.device.type != "cuda" or q.device.index != device_index:
             reason = "validated_gfx1151_device_is_required"
+        elif k.device != q.device or v.device != q.device:
+            reason = "qkv_must_share_one_device"
         elif q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
             reason = "matching_fp16_or_bf16_qkv_are_required"
 
@@ -250,9 +254,27 @@ def make_generic_pisa_override(
                 scale=kwargs.get("scale"),
                 return_backend=True,
             )
-        except Exception as exc:
-            runtime_state.record(is_self_attention=True, shape=(batch, heads, tokens, head_dim), error=exc)
-            raise RuntimeError(f"RDNA35 generic PISA failed for B={batch} H={heads} T={tokens} D={head_dim}") from exc
+        except (RuntimeError, ValueError, NotImplementedError) as exc:
+            if isinstance(exc, torch.OutOfMemoryError):
+                raise
+            reason = f"pisa_backend_error_{type(exc).__name__}"
+            runtime_state.record(
+                is_self_attention=True,
+                shape=(batch, heads, tokens, head_dim),
+                fallback_reason=reason,
+            )
+            return fallback(
+                original_func,
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
         runtime_state.record(layer=-1, is_self_attention=True, shape=(batch, heads, tokens, head_dim), backend=backend)
         output = output.unflatten(0, (batch, heads))
         if skip_output_reshape:

@@ -51,6 +51,7 @@ The generic benchmark below uses identical synthetic Q/K/V tensors and GPU-event
 
 | Shape | Generic PISA | PyTorch SDPA | Flash | SageAttention ROCm7 |
 |---|---:|---:|---:|---:|
+| FP16 SD1.5-like `B=1,H=8,T=8192,D=40` | **2.392 ms** | 5.877 ms | 3.848 ms | unsupported D=40 |
 | FP16 `B=1,H=8,T=8192,D=64` | **3.028 ms** | 5.380 ms | 5.343 ms | 5.857 ms |
 | BF16 `B=1,H=4,T=16384,D=128` | **8.232 ms** | 20.218 ms | 17.319 ms | 21.479 ms |
 
@@ -132,7 +133,9 @@ Otherwise dispatch falls back to the PyTorch reference implementation with a rea
 - Forward/inference only
 - The optimized PISA paths are gfx1151-only
 - Generic PISA prioritizes the fused CK HYD statistics profile for BF16 `D=128`; FP16 and other head dimensions up to 256 use the fused Triton statistics fallback
-- SDXL `T=4032,D=64` execution is verified. Wan and LTX dispatch contracts are wired, but require model-specific quality and performance validation before being called production profiles
+- SD1.5/SDXL, Wan, Wan AR, and LTX use generic PISA only for explicitly marked, unmasked self-attention with matching Q/K/V and `T>=8192`. Cross-attention, GQA, short sequences, Wan KV-cache attention, and LTX guide masks chain to the previous ComfyUI backend
+- SDXL `T=4032,D=64` fallback execution is verified. Wan and LTX dispatch contracts are covered by integration tests, but require model-specific output quality and performance validation before being called production profiles
+- A generic CK/Triton/Flex compile failure falls back to the previous attention backend; an out-of-memory error remains fatal so a second large allocation is not attempted
 - First use compiles two FlexAttention kernels; benchmark cold and steady-state runs separately
 - PISA output is approximate and can change composition relative to Flash Attention
 - Spatial sparse PISA accepts only the validated 23 exact blocks; other sparse budgets are rejected after real-model non-finite results at 32/33/36
