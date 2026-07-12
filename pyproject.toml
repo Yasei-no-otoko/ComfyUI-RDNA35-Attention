@@ -1,0 +1,17 @@
+[project]
+name = "rdna35-attention"
+description = "RDNA3.5 attention research nodes for ComfyUI, including fixed-block, exact Triton, and PISA paths."
+version = "0.1.0"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Yasei-no-otoko/ComfyUI-RDNA35-Attention"
+Documentation = "https://github.com/Yasei-no-otoko/ComfyUI-RDNA35-Attention#readme"
+Issues = "https://github.com/Yasei-no-otoko/ComfyUI-RDNA35-Attention/issues"
+
+[tool.comfy]
+PublisherId = "Yasei-no-otoko"
+DisplayName = "ComfyUI RDNA35 Attention"
+Icon = ""
