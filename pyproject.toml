@@ -12,6 +12,6 @@ Documentation = "https://github.com/Yasei-no-otoko/ComfyUI-RDNA35-Attention#read
 Issues = "https://github.com/Yasei-no-otoko/ComfyUI-RDNA35-Attention/issues"
 
 [tool.comfy]
-PublisherId = "Yasei-no-otoko"
+PublisherId = "Wildman"
 DisplayName = "ComfyUI RDNA35 Attention"
 Icon = ""
