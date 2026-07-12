@@ -208,7 +208,7 @@ def patch_model_pisa_attention(
             previous_override=previous_override,
             runtime_state=runtime_state,
         )
-        info = "model-local generic gfx1151 PISA installed for explicit self-attention with T>=2048 and arbitrary head dimension"
+        info = "model-local generic gfx1151 PISA installed for explicit self-attention with T>=8192 and arbitrary head dimension"
         if previous_override is not None:
             info += "; existing optimized_attention_override is chained for fallback"
         return model_clone, info

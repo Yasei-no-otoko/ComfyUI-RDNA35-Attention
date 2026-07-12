@@ -10,6 +10,7 @@ from .rdna35_block_attention.comfy_patch import patch_model_attention
 from .rdna35_block_attention.diagnostics import detect_runtime, explain_dispatch
 from .rdna35_block_attention.dispatch import fixed_block_attention
 from .rdna35_block_attention.full_attention import full_attention_triton
+from .rdna35_block_attention.generic_pisa import generic_pisa_attention
 from .rdna35_block_attention.pisa_attention import pisa_attention
 from .rdna35_block_attention.pisa_patch import patch_model_pisa_attention
 from .rdna35_block_attention.pisa_runtime import PISA_RUNTIME_ATTACHMENT
@@ -307,6 +308,113 @@ class RDNA35PISAAttentionBenchmark:
         ]),)
 
 
+class RDNA35GenericPISABenchmark:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "batch": ("INT", {"default": 1, "min": 1, "max": 8}),
+                "heads": ("INT", {"default": 10, "min": 1, "max": 40}),
+                "tokens": ("INT", {"default": 8192, "min": 8192, "max": 32768, "step": 64}),
+                "head_dim": ("INT", {"default": 64, "min": 32, "max": 256, "step": 8}),
+                "exact_budget": ("FLOAT", {"default": 0.25, "min": 0.015625, "max": 1.0, "step": 0.015625}),
+                "dtype": (["float16", "bfloat16"], {"default": "float16"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("benchmark",)
+    FUNCTION = "run"
+    CATEGORY = "RDNA35/Attention Research"
+    OUTPUT_NODE = True
+    EXPERIMENTAL = True
+
+    def run(self, batch, heads, tokens, head_dim, exact_budget, dtype):
+        from comfy.ldm.modules.attention import attention_pytorch, flash_attn_wrapper
+
+        device = torch.device("cuda")
+        compute_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
+        q = torch.randn(batch, heads, tokens, head_dim, device=device, dtype=compute_dtype)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        q_flat, k_flat, v_flat = (tensor.flatten(0, 1).contiguous() for tensor in (q, k, v))
+        output, backend = generic_pisa_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            exact_budget=exact_budget,
+            return_backend=True,
+        )
+        reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        pisa_ms = _median_ms(
+            lambda: generic_pisa_attention(q_flat, k_flat, v_flat, exact_budget=exact_budget),
+            device,
+            iterations=10,
+            warmup=3,
+        )
+        pytorch_ms = _median_ms(
+            lambda: attention_pytorch(q, k, v, heads, skip_reshape=True, skip_output_reshape=True),
+            device,
+            iterations=10,
+            warmup=3,
+        )
+        try:
+            def flash_attention():
+                return flash_attn_wrapper(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    dropout_p=0.0,
+                    causal=False,
+                ).transpose(1, 2)
+
+            flash_output = flash_attention()
+            flash_ms = _median_ms(
+                flash_attention,
+                device,
+                iterations=10,
+                warmup=3,
+            )
+            flash_cosine = torch.nn.functional.cosine_similarity(reference.float().flatten(), flash_output.float().flatten(), dim=0).item()
+            flash_mae = (flash_output.float() - reference).abs().mean().item()
+            flash_line = (
+                f"Flash Attention median: {flash_ms:.3f} ms; PISA/Flash={pisa_ms / flash_ms:.3f}x; "
+                f"cosine vs SDPA={flash_cosine:.9f}; MAE={flash_mae:.6g}"
+            )
+        except (ImportError, RuntimeError, ValueError) as exc:
+            flash_line = f"ComfyUI Flash Attention unavailable: {type(exc).__name__}: {exc}"
+        try:
+            from sageattention import sageattn
+
+            sage_output = sageattn(q, k, v, tensor_layout="HND", is_causal=False, smooth_k=False)
+            sage_ms = _median_ms(
+                lambda: sageattn(q, k, v, tensor_layout="HND", is_causal=False, smooth_k=False),
+                device,
+                iterations=10,
+                warmup=3,
+            )
+            sage_cosine = torch.nn.functional.cosine_similarity(reference.float().flatten(), sage_output.float().flatten(), dim=0).item()
+            sage_mae = (sage_output.float() - reference).abs().mean().item()
+            sage_line = (
+                f"SageAttention ROCm7 median: {sage_ms:.3f} ms; PISA/Sage={pisa_ms / sage_ms:.3f}x; "
+                f"cosine vs SDPA={sage_cosine:.9f}; MAE={sage_mae:.6g}"
+            )
+        except (ImportError, OSError, RuntimeError, ValueError, AssertionError) as exc:
+            sage_line = f"SageAttention ROCm7 unavailable: {type(exc).__name__}: {exc}"
+        cosine = torch.nn.functional.cosine_similarity(reference.float().flatten(), output.float().flatten(), dim=0).item()
+        return ("\n".join([
+            "RDNA35 Generic PISA Benchmark",
+            f"shape: B={batch} H={heads} T={tokens} D={head_dim} dtype={compute_dtype}",
+            f"statistics backend: {backend}",
+            f"PISA median: {pisa_ms:.3f} ms",
+            f"ComfyUI PyTorch SDPA median: {pytorch_ms:.3f} ms; PISA/SDPA={pisa_ms / pytorch_ms:.3f}x",
+            flash_line,
+            sage_line,
+            f"cosine vs dense SDPA: {cosine:.9f}",
+            f"mean abs error: {(output.float() - reference.flatten(0, 1)).abs().mean().item():.6g}",
+        ]),)
+
+
 class RDNA35PISARuntimeReport:
     @classmethod
     def INPUT_TYPES(cls):
@@ -348,6 +456,7 @@ NODE_CLASS_MAPPINGS: dict[str, Any] = {
     "RDNA35FixedBlockAttentionBenchmark": RDNA35FixedBlockAttentionBenchmark,
     "RDNA35FullAttentionBenchmark": RDNA35FullAttentionBenchmark,
     "RDNA35PISAAttentionBenchmark": RDNA35PISAAttentionBenchmark,
+    "RDNA35GenericPISABenchmark": RDNA35GenericPISABenchmark,
     "RDNA35PISARuntimeReport": RDNA35PISARuntimeReport,
 }
 
@@ -358,5 +467,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RDNA35FixedBlockAttentionBenchmark": "RDNA35 Fixed Block Attention Benchmark",
     "RDNA35FullAttentionBenchmark": "RDNA35 Exact Full Attention Benchmark",
     "RDNA35PISAAttentionBenchmark": "RDNA35 PISA Attention Benchmark",
+    "RDNA35GenericPISABenchmark": "RDNA35 Generic PISA Benchmark",
     "RDNA35PISARuntimeReport": "RDNA35 PISA Runtime Report",
 }

@@ -23,10 +23,11 @@ The Triton path is forward/inference only. There is no custom autograd or backwa
 
 - `RDNA35 Block Attention Diagnostics`: reports PyTorch, HIP, device, best-effort gfx target, Triton availability, and RDNA3.5 detection.
 - `RDNA35 Patch Model Attention`: installs a model-local `optimized_attention_override` on a cloned MODEL. It never globally monkey-patches ComfyUI attention.
-- `RDNA35 Patch PISA Attention`: installs a model-local PISA override. Anima keeps its validated `T=9216,D=128` spatial path. Explicitly marked SD1.5, SDXL, Wan, and LTX self-attention with `T>=2048` uses the generic path; cross-attention, masks, short sequences, and unsupported devices chain to the previous ComfyUI backend.
+- `RDNA35 Patch PISA Attention`: installs a model-local PISA override. Anima keeps its validated `T=9216,D=128` spatial path. Explicitly marked SD1.5, SDXL, Wan, and LTX self-attention with `T>=8192` uses the generic path; cross-attention, masks, short sequences, and unsupported devices chain to the previous ComfyUI backend.
 - `RDNA35 Fixed Block Attention Benchmark`: creates synthetic Q/K/V tensors, compares reference, dispatch, PyTorch SDPA with a block-diagonal mask, and normal PyTorch full SDPA. Full SDPA is reported as a semantic contrast, not as an exact replacement.
 - `RDNA35 Exact Full Attention Benchmark`: compares the gfx1151 online-softmax kernel with PyTorch SDPA for Anima-like self- and cross-attention shapes.
 - `RDNA35 PISA Attention Benchmark`: separates first-use compile time from GPU-event steady-state time and compares the CK/Flex hybrid with dense SDPA.
+- `RDNA35 Generic PISA Benchmark`: compares generic PISA, ComfyUI PyTorch SDPA, Flash Attention, and the optional SageAttention ROCm7 backend on one synthetic input. SageAttention supports only its advertised head dimensions; unsupported shapes are reported without aborting the other measurements.
 
 ## Measured gfx1151 results
 
@@ -45,6 +46,15 @@ The end-to-end comparison uses the same resident ComfyUI process after warm-up w
 | RDNA35 PISA CK/Flex fused | **65.94 s** | **68.38 s** | **10.16 s prompt (12.9%)** |
 
 The runtime verifier recorded `24/24` eligible self-attention calls, zero cross-attention calls, and zero fallbacks for one model forward. The table is an ABBA comparison in one resident process (Flash, PISA, PISA, Flash); unlike the superseded 0.7% table, it does not attribute a Flash fallback run to PISA. The native Q/K/V spatial pack is included in the complete call. The fused gfx1151 epilogue combines LSE weighting, FP32 correction, BF16 conversion, and block-major-to-raster output, while the spatial exact FlexAttention tile uses `BLOCK_N=32`.
+
+The generic benchmark below uses identical synthetic Q/K/V tensors and GPU-event medians after warm-up. Sage is [SageAttention ROCm7 1.0.6](https://github.com/guinmoon/SageAttention-Rocm7/releases/tag/v1.0.6_rocm7). These are kernel-level measurements, not end-to-end image quality results:
+
+| Shape | Generic PISA | PyTorch SDPA | Flash | SageAttention ROCm7 |
+|---|---:|---:|---:|---:|
+| FP16 `B=1,H=8,T=8192,D=64` | **3.028 ms** | 5.380 ms | 5.343 ms | 5.857 ms |
+| BF16 `B=1,H=4,T=16384,D=128` | **8.232 ms** | 20.218 ms | 17.319 ms | 21.479 ms |
+
+On the same inputs, Sage had cosine similarity 0.999933 and 0.999922 against dense SDPA. Generic PISA is intentionally approximate; its corresponding cosine values were 0.816255 and 0.812640 on random tensors, so its speed result must be paired with model-level quality validation before enabling a new profile. Five additional Sage-only rounds gave stable medians of 5.869 ms and 21.741 ms for the two rows.
 
 PISA is approximate and deliberately opt-in. Against Flash Attention, the coherent same-seed output measured SSIM 0.961379 and RGB cosine 0.999484. The spatial path accepts only the validated 23-block sparse profile: 32 became non-finite during 30 steps, 33/36 were non-finite on the first step, and other sparse budgets are not production-validated. The 144-block profile remains available only as the dense SDPA validation path.
 
@@ -75,6 +85,12 @@ Recommended runtime for the generic Triton research nodes:
 - PyTorch ROCm build
 - Triton compatible with that PyTorch ROCm build
 - AMD RDNA3.5 target such as `gfx1150`, `gfx1151`, or `gfx1152`
+
+The optional fourth benchmark backend is SageAttention ROCm7 1.0.6. Install its release wheel into the same Python environment as ComfyUI:
+
+```powershell
+python -m pip install --no-deps https://github.com/guinmoon/SageAttention-Rocm7/releases/download/v1.0.6_rocm7/sageattention-1.0.6-py3-none-any.whl
+```
 
 The prebuilt PISA wheel is narrower: Windows, BF16, and `gfx1151` only.
 

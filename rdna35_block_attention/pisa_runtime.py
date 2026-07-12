@@ -22,6 +22,7 @@ class PISARuntimeState:
     self_calls: int = 0
     cross_calls: int = 0
     shape_counts: Counter[tuple[int, ...]] = field(default_factory=Counter)
+    backend_counts: Counter[str] = field(default_factory=Counter)
     first_error: str | None = None
     _expected: int | None = field(default=None, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
@@ -46,6 +47,7 @@ class PISARuntimeState:
             self.self_calls = 0
             self.cross_calls = 0
             self.shape_counts.clear()
+            self.backend_counts.clear()
             self.first_error = None
             self._expected = None
 
@@ -57,6 +59,7 @@ class PISARuntimeState:
         shape: Iterable[int] | None = None,
         fallback_reason: str | None = None,
         error: BaseException | str | None = None,
+        backend: str | None = None,
     ) -> None:
         """Record one attention dispatch without retaining any tensor data."""
         with self._lock:
@@ -75,6 +78,9 @@ class PISARuntimeState:
                 self.failed = True
                 if self.first_error is None:
                     self.first_error = str(error)
+
+            if backend is not None:
+                self.backend_counts[str(backend)] += 1
 
             if layer is not None:
                 self.executed = True
@@ -108,8 +114,9 @@ class PISARuntimeState:
             expected = "?" if self._expected is None else str(self._expected)
             fallbacks = ",".join(f"{reason}:{count}" for reason, count in sorted(self.fallback_reasons.items())) or "-"
             shapes = ",".join(f"{shape}:{count}" for shape, count in sorted(self.shape_counts.items())) or "-"
+            backends = ",".join(f"{backend}:{count}" for backend, count in sorted(self.backend_counts.items())) or "-"
             return (
                 f"PISA armed={int(self.armed)} executed={int(self.executed)} verified={int(self.verified)} "
                 f"failed={int(self.failed)} hits={hits}/{expected} self={self.self_calls} cross={self.cross_calls} "
-                f"fallbacks={fallbacks} shapes={shapes} first_error={self.first_error or '-'}"
+                f"fallbacks={fallbacks} backends={backends} shapes={shapes} first_error={self.first_error or '-'}"
             )

@@ -23,7 +23,7 @@ class PISARuntimeStateTests(unittest.TestCase):
 
     def test_record_tracks_hits_fallbacks_calls_and_shapes(self):
         state = PISARuntimeState(armed=True)
-        state.record(layer=4, is_self_attention=True, shape=(1, 16, 9216, 128))
+        state.record(layer=4, is_self_attention=True, shape=(1, 16, 9216, 128), backend="ck_hyd")
         state.record(is_self_attention=False, shape=(1, 16, 9216, 512), fallback_reason="call_is_not_explicitly_self_attention")
         state.record(is_self_attention=True, fallback_reason="token_shape_is_not_expected")
 
@@ -33,6 +33,8 @@ class PISARuntimeStateTests(unittest.TestCase):
         self.assertEqual(state.cross_calls, 1)
         self.assertEqual(state.shape_counts[(1, 16, 9216, 128)], 1)
         self.assertEqual(state.fallback_reasons["call_is_not_explicitly_self_attention"], 1)
+        self.assertEqual(state.backend_counts["ck_hyd"], 1)
+        self.assertIn("backends=ck_hyd:1", state.report())
         self.assertIn("hits=1/?", state.report())
 
     def test_verify_requires_every_expected_layer_for_every_forward(self):
@@ -72,6 +74,7 @@ class PISARuntimeStateTests(unittest.TestCase):
         self.assertFalse(state.failed)
         self.assertEqual(state.per_layer_hits, {})
         self.assertEqual(state.fallback_reasons, {})
+        self.assertEqual(state.backend_counts, {})
         self.assertIsNone(state.first_error)
 
 

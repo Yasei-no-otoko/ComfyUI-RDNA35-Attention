@@ -10,7 +10,7 @@ from torch.nn.attention.flex_attention import AuxRequest, BlockMask, flex_attent
 
 
 BLOCK_SIZE = 64
-MIN_TOKENS = 2048
+MIN_TOKENS = 8192
 
 
 @functools.lru_cache(maxsize=8)
@@ -80,7 +80,7 @@ def _compiled_flex_kernels(tokens: int, head_dim: int, dtype: torch.dtype, devic
     return _flex_kernels(scale)
 
 
-def _block_stats(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+def _block_stats(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, return_backend: bool = False):
     batch_heads, tokens, head_dim = q.shape
     blocks = math.ceil(tokens / BLOCK_SIZE)
     padded_tokens = blocks * BLOCK_SIZE
@@ -99,8 +99,9 @@ def _block_stats(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
         capabilities = rdna35_pisa_ck.capabilities()
         if q.shape[-1] in capabilities.get("hyd_stats_head_dims", ()) and q.dtype in capabilities.get("hyd_stats_dtypes", ()):
-            return (*rdna35_pisa_ck.block_stats_hyd(q, k, v), lengths)
-    except (ImportError, OSError, RuntimeError, AttributeError):
+            result = (*rdna35_pisa_ck.block_stats_hyd(q, k, v), lengths)
+            return (*result, "ck_hyd") if return_backend else result
+    except (ImportError, OSError, RuntimeError, AttributeError, ValueError):
         pass
 
     q_blocks = q_padded.unflatten(1, (blocks, BLOCK_SIZE)).float()
@@ -110,10 +111,19 @@ def _block_stats(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
     k_centroids, v_sums, h_sum, _ = pisa_prepare_triton(k, v, block_size=BLOCK_SIZE)
     v_means = v_sums / denominator
-    return q_centroids, k_centroids, v_means, h_sum, lengths
+    result = (q_centroids, k_centroids, v_means, h_sum, lengths)
+    return (*result, "triton_hyd") if return_backend else result
 
 
-def generic_pisa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, exact_budget: float, scale: float | None = None) -> torch.Tensor:
+def generic_pisa_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    exact_budget: float,
+    scale: float | None = None,
+    return_backend: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, str]:
     if q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("generic PISA requires matching [BH,T,D] q/k/v")
     if q.shape[1] < MIN_TOKENS:
@@ -130,9 +140,10 @@ def generic_pisa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     exact_blocks = min(blocks, max(1, math.ceil(exact_budget * blocks)))
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     if exact_blocks == blocks:
-        return F.scaled_dot_product_attention(q[:, None], k[:, None], v[:, None], scale=scale_value).squeeze(1)
+        output = F.scaled_dot_product_attention(q[:, None], k[:, None], v[:, None], scale=scale_value).squeeze(1)
+        return (output, "dense_sdpa") if return_backend else output
 
-    q_centroids, k_centroids_float, v_means, h_sum, lengths = _block_stats(q, k, v)
+    q_centroids, k_centroids_float, v_means, h_sum, lengths, backend = _block_stats(q, k, v, return_backend=True)
     route_scores = torch.bmm(q_centroids.float(), k_centroids_float.float().transpose(1, 2))
     route_scores.mul_(scale_value)
     indices = torch.topk(route_scores, exact_blocks, dim=-1).indices.sort(dim=-1).values
@@ -170,7 +181,8 @@ def generic_pisa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     output = exact_output.float() * exact_weight[..., None]
     output.add_(approximate_output.float() * approximate_weight[..., None])
     output.add_(correction * approximate_weight[..., None])
-    return output.to(q.dtype)
+    output = output.to(q.dtype)
+    return (output, backend) if return_backend else output
 
 
 def make_generic_pisa_override(
@@ -230,11 +242,18 @@ def make_generic_pisa_override(
         q_flat, k_flat, v_flat = (tensor.contiguous().flatten(0, 1) for tensor in (q_bhtd, k_bhtd, v_bhtd))
         budget = exact_budget if head_dim == 128 and q.dtype == torch.bfloat16 else max(0.25, exact_budget)
         try:
-            output = generic_pisa_attention(q_flat, k_flat, v_flat, exact_budget=budget, scale=kwargs.get("scale"))
+            output, backend = generic_pisa_attention(
+                q_flat,
+                k_flat,
+                v_flat,
+                exact_budget=budget,
+                scale=kwargs.get("scale"),
+                return_backend=True,
+            )
         except Exception as exc:
             runtime_state.record(is_self_attention=True, shape=(batch, heads, tokens, head_dim), error=exc)
             raise RuntimeError(f"RDNA35 generic PISA failed for B={batch} H={heads} T={tokens} D={head_dim}") from exc
-        runtime_state.record(layer=-1, is_self_attention=True, shape=(batch, heads, tokens, head_dim))
+        runtime_state.record(layer=-1, is_self_attention=True, shape=(batch, heads, tokens, head_dim), backend=backend)
         output = output.unflatten(0, (batch, heads))
         if skip_output_reshape:
             return output
