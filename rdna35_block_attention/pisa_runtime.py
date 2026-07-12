@@ -23,7 +23,10 @@ class PISARuntimeState:
     cross_calls: int = 0
     shape_counts: Counter[tuple[int, ...]] = field(default_factory=Counter)
     backend_counts: Counter[str] = field(default_factory=Counter)
+    hit_context_counts: Counter[str] = field(default_factory=Counter)
     first_error: str | None = None
+    quality_sample: str | None = None
+    validated_profiles: set[tuple] = field(default_factory=set)
     _expected: int | None = field(default=None, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
@@ -48,7 +51,10 @@ class PISARuntimeState:
             self.cross_calls = 0
             self.shape_counts.clear()
             self.backend_counts.clear()
+            self.hit_context_counts.clear()
             self.first_error = None
+            self.quality_sample = None
+            self.validated_profiles.clear()
             self._expected = None
 
     def record(
@@ -60,6 +66,8 @@ class PISARuntimeState:
         fallback_reason: str | None = None,
         error: BaseException | str | None = None,
         backend: str | None = None,
+        context: str | None = None,
+        quality: str | None = None,
     ) -> None:
         """Record one attention dispatch without retaining any tensor data."""
         with self._lock:
@@ -81,6 +89,13 @@ class PISARuntimeState:
 
             if backend is not None:
                 self.backend_counts[str(backend)] += 1
+
+            if context is not None:
+                if backend is not None:
+                    self.hit_context_counts[str(context)] += 1
+
+            if quality is not None and self.quality_sample is None:
+                self.quality_sample = str(quality)
 
             if layer is not None:
                 self.executed = True
@@ -108,6 +123,14 @@ class PISARuntimeState:
             self.verified = True
             return True
 
+    def is_profile_validated(self, profile: tuple) -> bool:
+        with self._lock:
+            return profile in self.validated_profiles
+
+    def mark_profile_validated(self, profile: tuple) -> None:
+        with self._lock:
+            self.validated_profiles.add(profile)
+
     def report(self) -> str:
         with self._lock:
             hits = sum(self.per_layer_hits.values())
@@ -115,8 +138,9 @@ class PISARuntimeState:
             fallbacks = ",".join(f"{reason}:{count}" for reason, count in sorted(self.fallback_reasons.items())) or "-"
             shapes = ",".join(f"{shape}:{count}" for shape, count in sorted(self.shape_counts.items())) or "-"
             backends = ",".join(f"{backend}:{count}" for backend, count in sorted(self.backend_counts.items())) or "-"
+            hit_contexts = ",".join(f"{context}:{count}" for context, count in sorted(self.hit_context_counts.items())) or "-"
             return (
                 f"PISA armed={int(self.armed)} executed={int(self.executed)} verified={int(self.verified)} "
                 f"failed={int(self.failed)} hits={hits}/{expected} self={self.self_calls} cross={self.cross_calls} "
-                f"fallbacks={fallbacks} backends={backends} shapes={shapes} first_error={self.first_error or '-'}"
+                f"fallbacks={fallbacks} backends={backends} hit_contexts={hit_contexts} shapes={shapes} quality={self.quality_sample or '-'} first_error={self.first_error or '-'}"
             )

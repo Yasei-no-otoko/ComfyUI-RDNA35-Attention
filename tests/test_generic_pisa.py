@@ -5,7 +5,7 @@ from unittest import mock
 
 import torch
 
-from rdna35_block_attention.generic_pisa import MIN_TOKENS, _block_stats, make_generic_pisa_override
+from rdna35_block_attention.generic_pisa import MIN_TOKENS, _block_stats, _pack_spatial_blocks, _unpack_spatial_blocks, make_generic_pisa_override
 from rdna35_block_attention.pisa_runtime import PISARuntimeState
 
 
@@ -30,6 +30,12 @@ def _cuda_tensor(shape, dtype=torch.float16, tensor_type=FakeCudaTensor):
 
 
 class GenericPISADispatchTests(unittest.TestCase):
+    def test_spatial_block_layout_round_trip(self):
+        tensor = torch.arange(2 * 3 * 256 * 4).reshape(2, 3, 256, 4)
+        packed = _pack_spatial_blocks(tensor, 16)
+        self.assertFalse(torch.equal(packed, tensor))
+        torch.testing.assert_close(_unpack_spatial_blocks(packed, 16), tensor)
+
     def test_validated_ck_hyd_profile_has_priority(self):
         q = torch.randn(2, 128, 128, dtype=torch.bfloat16)
         outputs = (
@@ -98,12 +104,28 @@ class GenericPISADispatchTests(unittest.TestCase):
                     "rdna35_block_attention.generic_pisa.generic_pisa_attention",
                     return_value=(pisa_output, "triton_hyd"),
                 ) as pisa:
-                    output = override(mock.Mock(), q, q, q, heads, is_self_attention=True)
+                    output = override(mock.Mock(), q, q, q, heads, is_self_attention=True, transformer_options={"block": ("output", 4), "block_index": 1})
 
                 self.assertEqual(output.shape, q.shape)
-                self.assertEqual(pisa.call_args.kwargs["exact_budget"], 0.25)
+                expected_budget = 0.25
+                self.assertEqual(pisa.call_args.kwargs["exact_budget"], expected_budget)
+                self.assertEqual(pisa.call_args.kwargs["use_first_order"], head_dim == 128 and q.dtype == torch.bfloat16)
                 self.assertEqual(state.backend_counts["triton_hyd"], 1)
                 self.assertEqual(state.per_layer_hits[-1], 1)
+                self.assertEqual(state.hit_context_counts["output:4:1"], 1)
+
+    def test_square_unet_input_stage_stays_dense(self):
+        heads, head_dim = 10, 64
+        q = _cuda_tensor((1, 9216, heads * head_dim))
+        previous = mock.Mock(return_value="dense")
+        state = PISARuntimeState(armed=True)
+        override = make_generic_pisa_override(exact_budget=0.25, device_index=0, previous_override=previous, runtime_state=state)
+
+        output = override(mock.Mock(), q, q, q, heads, is_self_attention=True, transformer_options={"block": ("input", 4), "block_index": 0})
+
+        self.assertEqual(output, "dense")
+        self.assertEqual(state.fallback_reasons["spatial_input_stage_uses_dense_attention"], 1)
+        self.assertEqual(sum(state.per_layer_hits.values()), 0)
 
     def test_cross_masked_short_and_cached_video_calls_fall_back(self):
         heads, head_dim = 4, 16
@@ -162,6 +184,20 @@ class GenericPISADispatchTests(unittest.TestCase):
         ):
             with self.assertRaises(torch.OutOfMemoryError):
                 override(mock.Mock(), q, q, q, heads, is_self_attention=True)
+
+    def test_nonfinite_backend_output_falls_back(self):
+        heads, head_dim = 4, 16
+        q = _cuda_tensor((1, MIN_TOKENS, heads * head_dim))
+        previous = mock.Mock(return_value="fallback")
+        state = PISARuntimeState(armed=True)
+        override = make_generic_pisa_override(exact_budget=0.25, device_index=0, previous_override=previous, runtime_state=state)
+        output = torch.full((heads, MIN_TOKENS, head_dim), torch.nan, dtype=q.dtype)
+
+        with mock.patch("rdna35_block_attention.generic_pisa.generic_pisa_attention", return_value=(output, "triton_0th")):
+            self.assertEqual(override(mock.Mock(), q, q, q, heads, is_self_attention=True), "fallback")
+
+        self.assertEqual(state.fallback_reasons["pisa_backend_error_ValueError"], 1)
+        self.assertEqual(sum(state.per_layer_hits.values()), 0)
 
 
 if __name__ == "__main__":

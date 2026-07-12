@@ -338,16 +338,19 @@ class RDNA35GenericPISABenchmark:
         k = torch.randn_like(q)
         v = torch.randn_like(q)
         q_flat, k_flat, v_flat = (tensor.flatten(0, 1).contiguous() for tensor in (q, k, v))
+        use_first_order = head_dim == 128 and compute_dtype == torch.bfloat16
+        effective_budget = exact_budget if use_first_order else max(0.25, exact_budget)
         output, backend = generic_pisa_attention(
             q_flat,
             k_flat,
             v_flat,
-            exact_budget=exact_budget,
+            exact_budget=effective_budget,
+            use_first_order=use_first_order,
             return_backend=True,
         )
         reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         pisa_ms = _median_ms(
-            lambda: generic_pisa_attention(q_flat, k_flat, v_flat, exact_budget=exact_budget),
+            lambda: generic_pisa_attention(q_flat, k_flat, v_flat, exact_budget=effective_budget, use_first_order=use_first_order),
             device,
             iterations=10,
             warmup=3,

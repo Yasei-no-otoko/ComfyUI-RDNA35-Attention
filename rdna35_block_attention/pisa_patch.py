@@ -207,6 +207,7 @@ def patch_model_pisa_attention(
             device_index=device_index,
             previous_override=previous_override,
             runtime_state=runtime_state,
+            validate_output=verbose_fallbacks,
         )
         info = "model-local generic gfx1151 PISA installed for explicit self-attention with T>=8192 and arbitrary head dimension"
         if previous_override is not None:

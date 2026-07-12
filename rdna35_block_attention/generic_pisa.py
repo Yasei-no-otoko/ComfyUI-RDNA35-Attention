@@ -11,20 +11,21 @@ from torch.nn.attention.flex_attention import AuxRequest, BlockMask, flex_attent
 
 BLOCK_SIZE = 64
 MIN_TOKENS = 8192
+SPATIAL_BLOCK_EDGE = 8
 
 
-@functools.lru_cache(maxsize=8)
-def _full_block_mask(device: torch.device) -> BlockMask:
-    return BlockMask.from_kv_blocks(
-        torch.ones((1, 1, 1), device=device, dtype=torch.int32),
-        torch.zeros((1, 1, 1, 1), device=device, dtype=torch.int32),
-        BLOCK_SIZE=1 << 30,
-        seq_lengths=(1, 1),
-    )
+def _pack_spatial_blocks(tensor: torch.Tensor, side: int) -> torch.Tensor:
+    grid = side // SPATIAL_BLOCK_EDGE
+    return tensor.reshape(tensor.shape[0], tensor.shape[1], grid, SPATIAL_BLOCK_EDGE, grid, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
+
+
+def _unpack_spatial_blocks(tensor: torch.Tensor, side: int) -> torch.Tensor:
+    grid = side // SPATIAL_BLOCK_EDGE
+    return tensor.reshape(tensor.shape[0], tensor.shape[1], grid, grid, SPATIAL_BLOCK_EDGE, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
 
 
 def _flex_kernels(scale: float):
-    options = {
+    exact_options = {
         "fwd_BLOCK_M": 64,
         "fwd_BLOCK_N": 32,
         "fwd_num_stages": 1,
@@ -40,44 +41,38 @@ def _flex_kernels(scale: float):
             block_mask=block_mask,
             scale=scale,
             return_aux=AuxRequest(lse=True),
-            kernel_options=options,
+            kernel_options=exact_options,
         )
         return output[:, 0], auxiliary.lse[:, 0]
 
-    def approximate_attention(
-        q: torch.Tensor,
-        k_centroids: torch.Tensor,
-        v_means: torch.Tensor,
-        selected: torch.Tensor,
-        log_lengths: torch.Tensor,
-        block_mask: BlockMask,
-    ):
-        def score_mod(score, batch, head, query_index, key_index):
-            return torch.where(
-                selected[batch, query_index // BLOCK_SIZE, key_index],
-                -torch.inf,
-                score + log_lengths[key_index],
-            )
+    return torch.compile(exact_attention, fullgraph=True, dynamic=False)
 
-        output, auxiliary = flex_attention(
-            q[:, None],
-            k_centroids[:, None],
-            v_means[:, None],
-            block_mask=block_mask,
-            score_mod=score_mod,
-            scale=scale,
-            return_aux=AuxRequest(lse=True),
-            kernel_options=options,
-        )
-        return output[:, 0], auxiliary.lse[:, 0]
 
-    return torch.compile(exact_attention, fullgraph=True, dynamic=False), torch.compile(approximate_attention, fullgraph=True, dynamic=False)
+def _approximate_kernel(scale: float):
+    def approximate_attention(q: torch.Tensor, k_centroids: torch.Tensor, v_means: torch.Tensor, selected: torch.Tensor, log_lengths: torch.Tensor):
+        scores = torch.bmm(q.float(), k_centroids.float().transpose(1, 2))
+        scores.mul_(scale)
+        selected_tokens = selected.repeat_interleave(BLOCK_SIZE, dim=1)[:, : q.shape[1]]
+        scores.masked_fill_(selected_tokens, -torch.inf)
+        scores.add_(log_lengths[None, None])
+        lse = torch.logsumexp(scores, dim=-1)
+        probabilities = torch.softmax(scores, dim=-1)
+        output = torch.bmm(probabilities, v_means.float()).to(q.dtype)
+        return output, lse
+
+    return torch.compile(approximate_attention, fullgraph=True, dynamic=False)
 
 
 @functools.lru_cache(maxsize=32)
 def _compiled_flex_kernels(tokens: int, head_dim: int, dtype: torch.dtype, device_index: int, scale: float):
     del tokens, head_dim, dtype, device_index
     return _flex_kernels(scale)
+
+
+@functools.lru_cache(maxsize=32)
+def _compiled_approximate_kernel(tokens: int, head_dim: int, dtype: torch.dtype, device_index: int, scale: float):
+    del tokens, head_dim, dtype, device_index
+    return _approximate_kernel(scale)
 
 
 def _block_stats(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, return_backend: bool = False):
@@ -123,6 +118,8 @@ def generic_pisa_attention(
     exact_budget: float,
     scale: float | None = None,
     return_backend: bool = False,
+    use_first_order: bool = True,
+    debug_finite: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, str]:
     if q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("generic PISA requires matching [BH,T,D] q/k/v")
@@ -146,6 +143,16 @@ def generic_pisa_attention(
     q_centroids, k_centroids_float, v_means, h_sum, lengths, backend = _block_stats(q, k, v, return_backend=True)
     route_scores = torch.bmm(q_centroids.float(), k_centroids_float.float().transpose(1, 2))
     route_scores.mul_(scale_value)
+    if debug_finite:
+        finite_stats = {
+            "q_centroids": torch.isfinite(q_centroids).all().item(),
+            "k_centroids": torch.isfinite(k_centroids_float).all().item(),
+            "v_means": torch.isfinite(v_means).all().item(),
+            "route_scores": torch.isfinite(route_scores).all().item(),
+        }
+        failed_stats = [stage for stage, finite in finite_stats.items() if not finite]
+        if failed_stats:
+            raise ValueError(f"generic PISA non-finite stages: {','.join(failed_stats)}")
     indices = torch.topk(route_scores, exact_blocks, dim=-1).indices.sort(dim=-1).values
     selected = torch.zeros((batch_heads, blocks, blocks), device=q.device, dtype=torch.bool)
     selected.scatter_(2, indices, True)
@@ -162,7 +169,8 @@ def generic_pisa_attention(
         seq_lengths=(tokens, tokens),
         compute_q_blocks=False,
     )
-    exact_attention, approximate_attention = _compiled_flex_kernels(tokens, head_dim, q.dtype, q.get_device(), scale_value)
+    exact_attention = _compiled_flex_kernels(tokens, head_dim, q.dtype, q.get_device(), scale_value)
+    approximate_attention = _compiled_approximate_kernel(tokens, head_dim, q.dtype, q.get_device(), scale_value)
     exact_output, exact_lse = exact_attention(q, k, v, exact_mask)
     approximate_output, approximate_lse = approximate_attention(
         q,
@@ -170,19 +178,30 @@ def generic_pisa_attention(
         v_means,
         selected,
         lengths.log(),
-        _full_block_mask(q.device),
     )
+    if debug_finite:
+        finite_stages = {
+            "exact_output": torch.isfinite(exact_output).all().item(),
+            "exact_lse": torch.isfinite(exact_lse).all().item(),
+            "approximate_output": torch.isfinite(approximate_output).all().item(),
+            "approximate_lse": torch.isfinite(approximate_lse).all().item(),
+        }
+        failed_stages = [stage for stage, finite in finite_stages.items() if not finite]
+        if failed_stages:
+            raise ValueError(f"generic PISA non-finite stages: {','.join(failed_stages)}")
 
-    correction = torch.bmm(q, h_sum.to(q.dtype), out_dtype=torch.float32)
-    correction.mul_(scale_value / tokens)
     total_lse = torch.logaddexp(exact_lse, approximate_lse)
     exact_weight = torch.exp(exact_lse - total_lse)
     approximate_weight = torch.exp(approximate_lse - total_lse)
     output = exact_output.float() * exact_weight[..., None]
     output.add_(approximate_output.float() * approximate_weight[..., None])
-    output.add_(correction * approximate_weight[..., None])
+    if use_first_order:
+        correction = torch.bmm(q, h_sum.to(q.dtype), out_dtype=torch.float32)
+        correction.mul_(scale_value / tokens)
+        output.add_(correction * approximate_weight[..., None])
     output = output.to(q.dtype)
-    return (output, backend) if return_backend else output
+    reported_backend = backend if use_first_order else f"{backend.removesuffix('_hyd')}_0th"
+    return (output, reported_backend) if return_backend else output
 
 
 def make_generic_pisa_override(
@@ -191,6 +210,7 @@ def make_generic_pisa_override(
     device_index: int,
     previous_override: Callable | None,
     runtime_state,
+    validate_output: bool = False,
 ) -> Callable:
     def fallback(original_func, *args, **kwargs):
         if previous_override is not None:
@@ -198,6 +218,10 @@ def make_generic_pisa_override(
         return original_func(*args, **kwargs)
 
     def attention_override(original_func, q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+        transformer_options = kwargs.get("transformer_options") or {}
+        block = transformer_options.get("block")
+        block_index = transformer_options.get("block_index", 0)
+        context = f"{block[0]}:{block[1]}:{block_index}" if isinstance(block, (tuple, list)) and len(block) == 2 else None
         reason = None
         if kwargs.get("is_self_attention") is not True:
             reason = "not_explicit_self_attention"
@@ -240,11 +264,31 @@ def make_generic_pisa_override(
         if isinstance(q, torch.Tensor) and q.ndim >= 2:
             shape = tuple(q.shape)
         if reason is not None:
-            runtime_state.record(is_self_attention=kwargs.get("is_self_attention"), shape=shape, fallback_reason=reason)
+            runtime_state.record(is_self_attention=kwargs.get("is_self_attention"), shape=shape, fallback_reason=reason, context=context)
             return fallback(original_func, q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
 
+        side = math.isqrt(tokens)
+        spatial_layout = side * side == tokens and side % SPATIAL_BLOCK_EDGE == 0
+        if spatial_layout and isinstance(block, (tuple, list)) and block[0] == "input":
+            reason = "spatial_input_stage_uses_dense_attention"
+            runtime_state.record(is_self_attention=True, shape=(batch, heads, tokens, head_dim), fallback_reason=reason, context=context)
+            return fallback(
+                original_func,
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+        if spatial_layout:
+            q_bhtd, k_bhtd, v_bhtd = (_pack_spatial_blocks(tensor, side) for tensor in (q_bhtd, k_bhtd, v_bhtd))
         q_flat, k_flat, v_flat = (tensor.contiguous().flatten(0, 1) for tensor in (q_bhtd, k_bhtd, v_bhtd))
-        budget = exact_budget if head_dim == 128 and q.dtype == torch.bfloat16 else max(0.25, exact_budget)
+        use_first_order = head_dim == 128 and q.dtype == torch.bfloat16
+        budget = exact_budget if use_first_order else max(0.25, exact_budget)
         try:
             output, backend = generic_pisa_attention(
                 q_flat,
@@ -253,7 +297,14 @@ def make_generic_pisa_override(
                 exact_budget=budget,
                 scale=kwargs.get("scale"),
                 return_backend=True,
+                use_first_order=use_first_order,
+                debug_finite=validate_output,
             )
+            profile = (backend, batch, heads, tokens, head_dim, str(q.dtype))
+            if not runtime_state.is_profile_validated(profile):
+                if not torch.isfinite(output).all().item():
+                    raise ValueError("generic PISA produced non-finite output")
+                runtime_state.mark_profile_validated(profile)
         except (RuntimeError, ValueError, NotImplementedError) as exc:
             if isinstance(exc, torch.OutOfMemoryError):
                 raise
@@ -262,6 +313,8 @@ def make_generic_pisa_override(
                 is_self_attention=True,
                 shape=(batch, heads, tokens, head_dim),
                 fallback_reason=reason,
+                context=context,
+                error=exc if validate_output else None,
             )
             return fallback(
                 original_func,
@@ -275,8 +328,18 @@ def make_generic_pisa_override(
                 skip_output_reshape=skip_output_reshape,
                 **kwargs,
             )
-        runtime_state.record(layer=-1, is_self_attention=True, shape=(batch, heads, tokens, head_dim), backend=backend)
+        quality = None
+        if validate_output and runtime_state.quality_sample is None:
+            reference = F.scaled_dot_product_attention(q_flat[:, None], k_flat[:, None], v_flat[:, None], scale=kwargs.get("scale")).squeeze(1)
+            output_float = output.float()
+            reference_float = reference.float()
+            cosine = F.cosine_similarity(output_float.flatten(), reference_float.flatten(), dim=0).item()
+            mae = (output_float - reference_float).abs().mean().item()
+            quality = f"cos={cosine:.6f},mae={mae:.6g},pisa_max={output_float.abs().max().item():.6g},sdpa_max={reference_float.abs().max().item():.6g}"
+        runtime_state.record(layer=-1, is_self_attention=True, shape=(batch, heads, tokens, head_dim), backend=backend, context=context, quality=quality)
         output = output.unflatten(0, (batch, heads))
+        if spatial_layout:
+            output = _unpack_spatial_blocks(output, side)
         if skip_output_reshape:
             return output
         return output.transpose(1, 2).contiguous().flatten(2)
