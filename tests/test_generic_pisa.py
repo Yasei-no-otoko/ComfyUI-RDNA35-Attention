@@ -38,10 +38,13 @@ class GenericPISADispatchTests(unittest.TestCase):
         torch.testing.assert_close(_unpack_spatial_blocks(packed, 16), tensor)
 
     def test_video_block_layout_round_trip(self):
-        tensor = torch.arange(2 * 3 * 4 * 16 * 16 * 4).reshape(2, 3, 4 * 16 * 16, 4)
-        packed = _pack_video_blocks(tensor, (4, 16, 16))
-        self.assertFalse(torch.equal(packed, tensor))
-        torch.testing.assert_close(_unpack_video_blocks(packed, (4, 16, 16)), tensor)
+        for grid_sizes in ((4, 16, 16), (2, 32, 64)):
+            with self.subTest(grid_sizes=grid_sizes):
+                tokens = math.prod(grid_sizes)
+                tensor = torch.arange(2 * 3 * tokens * 4).reshape(2, 3, tokens, 4)
+                packed = _pack_video_blocks(tensor, grid_sizes)
+                self.assertFalse(torch.equal(packed, tensor))
+                torch.testing.assert_close(_unpack_video_blocks(packed, grid_sizes), tensor)
 
     def test_validated_ck_hyd_profile_has_priority(self):
         q = torch.randn(2, 128, 128, dtype=torch.bfloat16)
@@ -123,20 +126,21 @@ class GenericPISADispatchTests(unittest.TestCase):
 
     def test_wan_grid_uses_frame_local_spatial_blocks(self):
         heads, head_dim = 2, 8
-        grid_sizes = (2, 64, 64)
-        tokens = math.prod(grid_sizes)
-        q = FakeCudaTensor(torch.arange(tokens * heads * head_dim).remainder(1024).to(torch.float16).reshape(1, tokens, heads * head_dim))
-        state = PISARuntimeState(armed=True)
-        override = make_generic_pisa_override(exact_budget=0.25, device_index=0, previous_override=None, runtime_state=state)
+        for grid_sizes in ((2, 64, 64), (4, 32, 64)):
+            with self.subTest(grid_sizes=grid_sizes):
+                tokens = math.prod(grid_sizes)
+                q = FakeCudaTensor(torch.arange(tokens * heads * head_dim).remainder(1024).to(torch.float16).reshape(1, tokens, heads * head_dim))
+                state = PISARuntimeState(armed=True)
+                override = make_generic_pisa_override(exact_budget=0.25, device_index=0, previous_override=None, runtime_state=state)
 
-        def identity_pisa(q_flat, k_flat, v_flat, **kwargs):
-            return q_flat, "triton_hyd"
+                def identity_pisa(q_flat, k_flat, v_flat, **kwargs):
+                    return q_flat, "triton_hyd"
 
-        with mock.patch("rdna35_block_attention.generic_pisa.generic_pisa_attention", side_effect=identity_pisa):
-            output = override(mock.Mock(), q, q, q, heads, is_self_attention=True, transformer_options={"grid_sizes": grid_sizes})
+                with mock.patch("rdna35_block_attention.generic_pisa.generic_pisa_attention", side_effect=identity_pisa):
+                    output = override(mock.Mock(), q, q, q, heads, is_self_attention=True, transformer_options={"grid_sizes": grid_sizes})
 
-        torch.testing.assert_close(output, q)
-        self.assertEqual(state.backend_counts["triton_hyd"], 1)
+                torch.testing.assert_close(output, q)
+                self.assertEqual(state.backend_counts["triton_hyd"], 1)
 
     def test_square_unet_input_stage_stays_dense(self):
         heads, head_dim = 10, 64

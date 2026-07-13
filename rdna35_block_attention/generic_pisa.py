@@ -14,32 +14,42 @@ MIN_TOKENS = 8192
 SPATIAL_BLOCK_EDGE = 8
 
 
+def _pack_spatial_blocks_2d(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    grid_height = height // SPATIAL_BLOCK_EDGE
+    grid_width = width // SPATIAL_BLOCK_EDGE
+    return tensor.reshape(tensor.shape[0], tensor.shape[1], grid_height, SPATIAL_BLOCK_EDGE, grid_width, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
+
+
+def _unpack_spatial_blocks_2d(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    grid_height = height // SPATIAL_BLOCK_EDGE
+    grid_width = width // SPATIAL_BLOCK_EDGE
+    return tensor.reshape(tensor.shape[0], tensor.shape[1], grid_height, grid_width, SPATIAL_BLOCK_EDGE, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
+
+
 def _pack_spatial_blocks(tensor: torch.Tensor, side: int) -> torch.Tensor:
-    grid = side // SPATIAL_BLOCK_EDGE
-    return tensor.reshape(tensor.shape[0], tensor.shape[1], grid, SPATIAL_BLOCK_EDGE, grid, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
+    return _pack_spatial_blocks_2d(tensor, side, side)
 
 
 def _unpack_spatial_blocks(tensor: torch.Tensor, side: int) -> torch.Tensor:
-    grid = side // SPATIAL_BLOCK_EDGE
-    return tensor.reshape(tensor.shape[0], tensor.shape[1], grid, grid, SPATIAL_BLOCK_EDGE, SPATIAL_BLOCK_EDGE, tensor.shape[-1]).permute(0, 1, 2, 4, 3, 5, 6).reshape_as(tensor).contiguous()
+    return _unpack_spatial_blocks_2d(tensor, side, side)
 
 
 def _pack_video_blocks(tensor: torch.Tensor, grid_sizes: tuple[int, int, int]) -> torch.Tensor:
     frames, height, width = grid_sizes
     batch, heads, tokens, head_dim = tensor.shape
-    if height != width or tokens != frames * height * width:
-        raise ValueError("video token shape does not match a square spatial grid")
+    if tokens != frames * height * width:
+        raise ValueError("video token shape does not match grid_sizes")
     per_frame = tensor.unflatten(2, (frames, height * width)).transpose(1, 2).flatten(0, 1)
-    return _pack_spatial_blocks(per_frame, height).unflatten(0, (batch, frames)).transpose(1, 2).flatten(2, 3)
+    return _pack_spatial_blocks_2d(per_frame, height, width).unflatten(0, (batch, frames)).transpose(1, 2).flatten(2, 3)
 
 
 def _unpack_video_blocks(tensor: torch.Tensor, grid_sizes: tuple[int, int, int]) -> torch.Tensor:
     frames, height, width = grid_sizes
     batch, heads, tokens, head_dim = tensor.shape
-    if height != width or tokens != frames * height * width:
-        raise ValueError("video token shape does not match a square spatial grid")
+    if tokens != frames * height * width:
+        raise ValueError("video token shape does not match grid_sizes")
     per_frame = tensor.unflatten(2, (frames, height * width)).transpose(1, 2).flatten(0, 1)
-    return _unpack_spatial_blocks(per_frame, height).unflatten(0, (batch, frames)).transpose(1, 2).flatten(2, 3)
+    return _unpack_spatial_blocks_2d(per_frame, height, width).unflatten(0, (batch, frames)).transpose(1, 2).flatten(2, 3)
 
 
 def _flex_kernels(scale: float):
@@ -293,8 +303,8 @@ def make_generic_pisa_override(
             and len(grid_sizes) == 3
             and all(isinstance(value, int) and value > 0 for value in grid_sizes)
             and math.prod(grid_sizes) == tokens
-            and grid_sizes[1] == grid_sizes[2]
             and grid_sizes[1] % SPATIAL_BLOCK_EDGE == 0
+            and grid_sizes[2] % SPATIAL_BLOCK_EDGE == 0
         )
         video_grid = tuple(grid_sizes) if video_layout else None
         side = math.isqrt(tokens)
