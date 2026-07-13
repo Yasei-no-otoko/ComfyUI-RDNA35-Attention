@@ -6,10 +6,11 @@ import torch
 
 
 ANIMA_BLOCK_COUNT = 28
-ANIMA_PISA_START_LAYER = 4
 ANIMA_PISA_TOKENS = 9216
 ANIMA_PISA_HEADS = 16
 ANIMA_PISA_HEAD_DIM = 128
+ANIMA_PISA_FIRST_LAYER = 20
+ANIMA_PISA_LAST_LAYER = 27
 
 
 def _record(runtime_state: Any | None, **kwargs) -> None:
@@ -100,13 +101,17 @@ def install_anima_pisa_attention(
     native_forward: Callable,
     exact_blocks: int,
     device_index: int,
+    first_layer: int,
+    last_layer: int,
     runtime_state: Any | None = None,
 ) -> int:
     validate_anima_pisa_model(model_patcher)
+    if not 0 <= first_layer <= last_layer < ANIMA_BLOCK_COUNT:
+        raise ValueError(f"expected 0 <= first_layer <= last_layer < {ANIMA_BLOCK_COUNT}")
     diffusion_model = model_patcher.get_model_object("diffusion_model")
     blocks = diffusion_model.blocks
 
-    for index in range(ANIMA_PISA_START_LAYER, ANIMA_BLOCK_COUNT):
+    for index in range(first_layer, last_layer + 1):
         self_attn = blocks[index].self_attn
         model_patcher.add_object_patch(
             f"diffusion_model.blocks.{index}.self_attn.attn_op",
@@ -119,4 +124,4 @@ def install_anima_pisa_attention(
                 runtime_state=runtime_state,
             ),
         )
-    return ANIMA_BLOCK_COUNT - ANIMA_PISA_START_LAYER
+    return last_layer - first_layer + 1

@@ -173,6 +173,7 @@ __global__ void block_stats_hyd_kernel(
     float* __restrict__ k_centroids,
     T* __restrict__ v_means,
     float* __restrict__ h_sum,
+    float* __restrict__ h_norm,
     int tokens,
     int blocks,
     int head_dim)
@@ -181,6 +182,7 @@ __global__ void block_stats_hyd_kernel(
     float* q_mean = means;
     float* k_mean = q_mean + head_dim;
     float* v_mean = k_mean + head_dim;
+    float* norm_reduction = v_mean + head_dim;
     const int group = blockIdx.x;
     const int bh = group / blocks;
     const int sequence_block = group - bh * blocks;
@@ -211,6 +213,7 @@ __global__ void block_stats_hyd_kernel(
     __syncthreads();
 
     const int elements = head_dim * head_dim;
+    float local_norm = 0.0f;
     for(int element = threadIdx.x; element < elements; element += blockDim.x)
     {
         const int row_dim = element / head_dim;
@@ -222,6 +225,21 @@ __global__ void block_stats_hyd_kernel(
             value += (load_float(k, base + row_dim) - k_mean[row_dim]) * load_float(v, base + column_dim);
         }
         atomicAdd(h_sum + (static_cast<int64_t>(bh) * head_dim + row_dim) * head_dim + column_dim, value);
+        local_norm += value * value;
+    }
+    norm_reduction[threadIdx.x] = local_norm;
+    __syncthreads();
+    for(int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if(threadIdx.x < stride)
+        {
+            norm_reduction[threadIdx.x] += norm_reduction[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if(threadIdx.x == 0)
+    {
+        h_norm[group] = sqrtf(norm_reduction[0]);
     }
 }
 
@@ -436,6 +454,7 @@ void launch_block_stats_hyd(
     torch::Tensor& k_centroids,
     torch::Tensor& v_means,
     torch::Tensor& h_sum,
+    torch::Tensor& h_norm,
     int tokens,
     int blocks,
     int head_dim,
@@ -446,7 +465,7 @@ void launch_block_stats_hyd(
         HIP_KERNEL_NAME(block_stats_hyd_kernel<T>),
         dim3(batch_heads * blocks),
         dim3(256),
-        static_cast<std::size_t>(3 * head_dim) * sizeof(float),
+        static_cast<std::size_t>(3 * head_dim + 256) * sizeof(float),
         stream,
         reinterpret_cast<const T*>(q.data_ptr()),
         reinterpret_cast<const T*>(k.data_ptr()),
@@ -455,6 +474,7 @@ void launch_block_stats_hyd(
         k_centroids.data_ptr<float>(),
         reinterpret_cast<T*>(v_means.data_ptr()),
         h_sum.data_ptr<float>(),
+        h_norm.data_ptr<float>(),
         tokens,
         blocks,
         head_dim);
@@ -574,7 +594,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats_hyd(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats_hyd(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v)
@@ -602,15 +622,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_bloc
     auto k_centroids = torch::empty({q.size(0), blocks, head_dim}, q.options().dtype(torch::kFloat32));
     auto v_means = torch::empty_like(q_centroids);
     auto h_sum = torch::zeros({q.size(0), head_dim, head_dim}, q.options().dtype(torch::kFloat32));
+    auto h_norm = torch::empty({q.size(0), blocks}, q.options().dtype(torch::kFloat32));
     if(q.scalar_type() == at::kBFloat16)
     {
-        launch_block_stats_hyd<ck_tile::bf16_t>(q, k, v, q_centroids, k_centroids, v_means, h_sum, tokens, blocks, head_dim, stream);
+        launch_block_stats_hyd<ck_tile::bf16_t>(q, k, v, q_centroids, k_centroids, v_means, h_sum, h_norm, tokens, blocks, head_dim, stream);
     }
     else
     {
-        launch_block_stats_hyd<ck_tile::half_t>(q, k, v, q_centroids, k_centroids, v_means, h_sum, tokens, blocks, head_dim, stream);
+        launch_block_stats_hyd<ck_tile::half_t>(q, k, v, q_centroids, k_centroids, v_means, h_sum, h_norm, tokens, blocks, head_dim, stream);
     }
-    return {q_centroids, k_centroids, v_means, h_sum};
+    return {q_centroids, k_centroids, v_means, h_sum, h_norm};
 }
 
 

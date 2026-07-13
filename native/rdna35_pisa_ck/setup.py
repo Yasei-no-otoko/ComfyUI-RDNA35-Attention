@@ -72,7 +72,7 @@ setup(
             ],
             include_dirs=INCLUDE_DIRS,
             define_macros=[
-                ("RDNA35_PISA_CK_API", "5"),
+                ("RDNA35_PISA_CK_API", "6"),
             ],
             extra_compile_args={
                 "cxx": [],

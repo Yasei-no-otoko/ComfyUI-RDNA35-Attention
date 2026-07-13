@@ -76,7 +76,7 @@ class PISAPatchTests(unittest.TestCase):
         model = DummyModel({"optimized_attention_override": previous})
 
         ck_module = Mock()
-        ck_module.build_info.return_value = {"api": 5}
+        ck_module.build_info.return_value = {"api": 6}
         ck_module.capabilities.return_value = {"spatial_sparse_exact_blocks": (23,)}
         with patch("rdna35_block_attention.pisa_patch._gfx1151_device_index", return_value=(0, None)), patch.dict(sys.modules, {"rdna35_pisa_ck": ck_module}):
             patched, _ = patch_model_pisa_attention(
@@ -94,7 +94,7 @@ class PISAPatchTests(unittest.TestCase):
     def test_generic_patch_accepts_non_anima_sparse_budget(self):
         model = DummyModel()
         ck_module = Mock()
-        ck_module.build_info.return_value = {"api": 5}
+        ck_module.build_info.return_value = {"api": 6}
         ck_module.capabilities.return_value = {"spatial_sparse_exact_blocks": (23,)}
 
         with patch("rdna35_block_attention.pisa_patch._gfx1151_device_index", return_value=(0, None)), patch.dict(sys.modules, {"rdna35_pisa_ck": ck_module}):

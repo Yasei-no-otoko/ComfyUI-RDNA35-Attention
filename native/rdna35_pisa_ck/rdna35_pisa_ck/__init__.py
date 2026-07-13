@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import AuxRequest, BlockMask, flex_attention
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 _EXPECTED_TORCH_VERSION = "2.14.0a0+rocm7.15.0a20260704"
 _EXPECTED_HIP_VERSION = "7.15.26263"
-_EXPECTED_NATIVE_API = 5
+_EXPECTED_NATIVE_API = 6
 _EXPECTED_CXX_TORCH_VERSION = "2.14.0"
 _EXPECTED_HIP_BUILD_VERSION = (7, 15, 26263)
 _EXPECTED_CK_COMMIT = "4975bd0c8e17a54bdc27c746527a385e7383bb07"
@@ -183,22 +183,6 @@ def _block_lengths(tokens: int, device: torch.device) -> torch.Tensor:
     return torch.tensor(values, device=device, dtype=torch.float32)
 
 
-def _centered_h_sum(k: torch.Tensor, v: torch.Tensor, k_centroids: torch.Tensor) -> torch.Tensor:
-    tokens = k.shape[1]
-    blocks = k_centroids.shape[1]
-    centered = torch.empty_like(k)
-    if tokens == blocks * BLOCK_SIZE:
-        torch.sub(
-            k.unflatten(1, (blocks, BLOCK_SIZE)),
-            k_centroids[:, :, None],
-            out=centered.unflatten(1, (blocks, BLOCK_SIZE)),
-        )
-    else:
-        block_means = torch.repeat_interleave(k_centroids, BLOCK_SIZE, dim=1)[:, :tokens]
-        torch.sub(k, block_means, out=centered)
-    return torch.bmm(centered.transpose(1, 2), v, out_dtype=torch.float32)
-
-
 @functools.lru_cache(maxsize=8)
 def _full_block_mask(device_index: int) -> BlockMask:
     device = torch.device("cuda", device_index)
@@ -210,30 +194,23 @@ def _full_block_mask(device_index: int) -> BlockMask:
     )
 
 
-@torch.library.custom_op("rdna35_pisa_ck::block_stats", mutates_args=(), device_types="cuda")
-def _block_stats_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _C.block_stats(q, k, v)
-
-
-@_block_stats_op.register_fake
-def _block_stats_op_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del k, v
-    blocks = (q.shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
-    shape = (q.shape[0], blocks, q.shape[2])
-    return q.new_empty(shape), q.new_empty(shape, dtype=torch.float32), q.new_empty(shape)
-
-
 @torch.library.custom_op("rdna35_pisa_ck::block_stats_hyd", mutates_args=(), device_types="cuda")
-def _block_stats_hyd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _block_stats_hyd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _C.block_stats_hyd(q, k, v)
 
 
 @_block_stats_hyd_op.register_fake
-def _block_stats_hyd_op_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _block_stats_hyd_op_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del k, v
     blocks = (q.shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE
     shape = (q.shape[0], blocks, q.shape[2])
-    return q.new_empty(shape), q.new_empty(shape, dtype=torch.float32), q.new_empty(shape), q.new_empty((q.shape[0], q.shape[2], q.shape[2]), dtype=torch.float32)
+    return (
+        q.new_empty(shape),
+        q.new_empty(shape, dtype=torch.float32),
+        q.new_empty(shape),
+        q.new_empty((q.shape[0], q.shape[2], q.shape[2]), dtype=torch.float32),
+        q.new_empty((q.shape[0], blocks), dtype=torch.float32),
+    )
 
 
 def block_stats_hyd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -250,7 +227,7 @@ def block_stats_hyd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[
         raise ValueError("PISA CK HYD requires contiguous q/k/v.")
     if q.requires_grad or k.requires_grad or v.requires_grad:
         raise ValueError("PISA CK HYD is forward-only.")
-    return _block_stats_hyd_op(q, k, v)
+    return _block_stats_hyd_op(q, k, v)[:4]
 
 
 def _forward_impl(
@@ -274,14 +251,14 @@ def _forward_impl(
     if exact_blocks == blocks:
         return F.scaled_dot_product_attention(q[:, None], k[:, None], v[:, None], scale=scale).squeeze(1)
 
-    q_centroids, k_centroids_float, v_means = _block_stats_op(q, k, v)
+    q_centroids, k_centroids_float, v_means, h_sum, h_norm = _block_stats_hyd_op(q, k, v)
     k_centroids = k_centroids_float.to(q.dtype)
     lengths = _block_lengths(tokens, q.device)
-    h_sum = _centered_h_sum(k, v, k_centroids_float)
 
     if exact_blocks > 0:
         route_scores = torch.bmm(q_centroids, k_centroids.transpose(1, 2), out_dtype=torch.float32)
         route_scores.mul_(scale)
+        route_scores.add_(torch.log(h_norm[:, None, :] + 1e-5))
         if sink_block != -2:
             route_scores[..., sink_block] = torch.inf
         indices = torch.topk(route_scores, exact_blocks, dim=-1).indices.sort(dim=-1).values
@@ -485,6 +462,7 @@ def capabilities() -> dict[str, object]:
         "causal": False,
         "backward": False,
         "first_order_tail": True,
+        "first_order_routing_bias": True,
         "flex_attention": True,
         "outer_torch_compile": True,
         "outer_torch_compile_requires_prepare": True,

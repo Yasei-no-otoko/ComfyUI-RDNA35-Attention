@@ -39,7 +39,7 @@ class PISARuntimeReportTests(unittest.TestCase):
     def test_success_returns_the_original_latent_and_verified_report(self):
         state = PISARuntimeState(armed=True)
         for _ in range(2):
-            for layer in range(4, 28):
+            for layer in range(20, 28):
                 state.record(layer=layer, is_self_attention=True)
         latent = {"samples": object()}
 
@@ -50,7 +50,7 @@ class PISARuntimeReportTests(unittest.TestCase):
         self.assertEqual(output["ui"]["text"], [report])
         self.assertTrue(state.verified)
         self.assertIn("verified=1", report)
-        self.assertIn("hits=48/48", report)
+        self.assertIn("hits=16/16", report)
 
     def test_zero_hits_are_rejected_as_an_invalid_benchmark(self):
         state = PISARuntimeState(armed=True)
@@ -61,11 +61,20 @@ class PISARuntimeReportTests(unittest.TestCase):
 
     def test_incomplete_layer_accounting_is_rejected(self):
         state = PISARuntimeState(armed=True)
-        for layer in range(4, 27):
+        for layer in range(20, 27):
             state.record(layer=layer, is_self_attention=True)
 
         with self.assertRaisesRegex(RuntimeError, "Incomplete PISA layer accounting"):
             RDNA35PISARuntimeReport().run(DummyModel(state), {"samples": object()})
+
+    def test_configured_layer_range_is_verified(self):
+        state = PISARuntimeState(armed=True, expected_layers=tuple(range(8, 20)))
+        for layer in range(8, 20):
+            state.record(layer=layer, is_self_attention=True)
+
+        output = RDNA35PISARuntimeReport().run(DummyModel(state), {"samples": object()})
+
+        self.assertIn("hits=12/12", output["result"][1])
 
 
 if __name__ == "__main__":

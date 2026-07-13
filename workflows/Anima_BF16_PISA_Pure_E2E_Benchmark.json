@@ -116,9 +116,11 @@
       },
       "widgets_values": [
         true,
-        false
+        false,
+        20,
+        27
       ],
-      "title": "PISA enabled; disable for selected backend baseline"
+      "title": "PISA HYD quality profile: layers 20-27; disable for baseline"
     },
     {
       "id": 4,

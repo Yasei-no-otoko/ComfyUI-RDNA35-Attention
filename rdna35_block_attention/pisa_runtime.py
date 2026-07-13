@@ -27,16 +27,23 @@ class PISARuntimeState:
     first_error: str | None = None
     quality_sample: str | None = None
     validated_profiles: set[tuple] = field(default_factory=set)
+    expected_layers: tuple[int, ...] = ()
     _expected: int | None = field(default=None, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     @staticmethod
-    def expected_calls(actual_forwards: int, start_layer: int = 4, total_layers: int = 28) -> int:
+    def expected_calls(
+        actual_forwards: int,
+        start_layer: int = 20,
+        total_layers: int = 28,
+        layers: Iterable[int] | None = None,
+    ) -> int:
         if actual_forwards < 0:
             raise ValueError("actual_forwards must be non-negative")
         if start_layer < 0 or total_layers < start_layer:
             raise ValueError("expected 0 <= start_layer <= total_layers")
-        return actual_forwards * (total_layers - start_layer)
+        expected_layers = tuple(range(start_layer, total_layers)) if layers is None else tuple(layers)
+        return actual_forwards * len(expected_layers)
 
     def reset(self, *, armed: bool | None = None) -> None:
         with self._lock:
@@ -101,9 +108,9 @@ class PISARuntimeState:
                 self.executed = True
                 self.per_layer_hits[int(layer)] += 1
 
-    def verify(self, actual_forwards: int, start_layer: int = 4, total_layers: int = 28) -> bool:
-        expected = self.expected_calls(actual_forwards, start_layer, total_layers)
-        expected_layers = range(start_layer, total_layers)
+    def verify(self, actual_forwards: int, start_layer: int = 20, total_layers: int = 28) -> bool:
+        expected_layers = self.expected_layers or tuple(range(start_layer, total_layers))
+        expected = self.expected_calls(actual_forwards, layers=expected_layers)
         with self._lock:
             self._expected = expected
             if self.failed:

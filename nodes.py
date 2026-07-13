@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from .rdna35_block_attention.anima_pisa_integration import ANIMA_PISA_FIRST_LAYER, ANIMA_PISA_LAST_LAYER
 from .rdna35_block_attention.comfy_patch import patch_model_attention
 from .rdna35_block_attention.diagnostics import detect_runtime, explain_dispatch
 from .rdna35_block_attention.dispatch import fixed_block_attention
@@ -78,7 +79,11 @@ class RDNA35PatchAnimaPISAAttention:
                 "model": ("MODEL",),
                 "enabled": ("BOOLEAN", {"default": True}),
                 "verbose_fallbacks": ("BOOLEAN", {"default": False}),
-            }
+            },
+            "optional": {
+                "first_pisa_layer": ("INT", {"default": ANIMA_PISA_FIRST_LAYER, "min": 0, "max": 27}),
+                "last_pisa_layer": ("INT", {"default": ANIMA_PISA_LAST_LAYER, "min": 0, "max": 27}),
+            },
         }
 
     RETURN_TYPES = ("MODEL", "STRING")
@@ -87,13 +92,21 @@ class RDNA35PatchAnimaPISAAttention:
     CATEGORY = "RDNA35/Attention Research"
     EXPERIMENTAL = True
 
-    def patch(self, model, enabled, verbose_fallbacks):
+    def patch(
+        self,
+        model,
+        enabled,
+        verbose_fallbacks,
+        first_pisa_layer=ANIMA_PISA_FIRST_LAYER,
+        last_pisa_layer=ANIMA_PISA_LAST_LAYER,
+    ):
         return patch_model_pisa_attention(
             model,
             enabled=enabled,
             exact_budget=0.15625,
             token_policy="anima_1536_spatial",
-            start_layer=4,
+            start_layer=first_pisa_layer,
+            end_layer=last_pisa_layer,
             verbose_fallbacks=verbose_fallbacks,
         )
 
@@ -442,7 +455,8 @@ class RDNA35PISARuntimeReport:
                 raise RuntimeError(f"Generic PISA runtime failed: {state.report()}")
             return {"ui": {"text": [state.report()]}, "result": (latent, state.report())}
         counts = set(state.per_layer_hits.values())
-        if set(state.per_layer_hits) != set(range(4, 28)) or len(counts) != 1:
+        expected_layers = set(state.expected_layers or range(ANIMA_PISA_FIRST_LAYER, ANIMA_PISA_LAST_LAYER + 1))
+        if set(state.per_layer_hits) != expected_layers or len(counts) != 1:
             raise RuntimeError(f"Incomplete PISA layer accounting: {state.report()}")
         forwards = counts.pop()
         state.verify(forwards)

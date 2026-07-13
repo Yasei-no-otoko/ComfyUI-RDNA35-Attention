@@ -63,18 +63,23 @@ def _pisa_reference(
     ).to(v.dtype).float()
     v_means = v_sums / lengths_tensor[None, :, None]
 
+    h_sum = torch.zeros((batch_heads, HEAD_DIM, HEAD_DIM), device=q.device, dtype=torch.float32)
+    h_norms = []
+    for block, (start, length) in enumerate(zip(range(0, tokens, BLOCK_SIZE), lengths)):
+        centered = (k_float[:, start : start + length] - k_centroids_float[:, block, None]).to(k.dtype).float()
+        h_block = torch.bmm(centered.transpose(1, 2), v_float[:, start : start + length])
+        h_sum.add_(h_block)
+        h_norms.append(torch.linalg.matrix_norm(h_block))
+
     selected = torch.zeros((batch_heads, blocks, blocks), device=q.device, dtype=torch.bool)
     if exact_blocks:
         route_scores = torch.bmm(q_centroids, k_centroids.transpose(1, 2)) * scale_value
+        route_scores.add_((torch.stack(h_norms, dim=1) + 1e-5).log())
         if sink_block is not None:
             route_scores[..., sink_block] = torch.inf
         indices = torch.topk(route_scores, exact_blocks, dim=-1).indices
         selected.scatter_(2, indices, True)
 
-    h_sum = torch.zeros((batch_heads, HEAD_DIM, HEAD_DIM), device=q.device, dtype=torch.float32)
-    for block, (start, length) in enumerate(zip(range(0, tokens, BLOCK_SIZE), lengths)):
-        centered = (k_float[:, start : start + length] - k_centroids_float[:, block, None]).to(k.dtype).float()
-        h_sum.add_(torch.bmm(centered.transpose(1, 2), v_float[:, start : start + length]))
     correction = torch.bmm(q_float, h_sum) * (scale_value / tokens)
     values = torch.cat((v_float, v_means), dim=1)
     output = torch.empty_like(q_float)
@@ -172,6 +177,28 @@ class TestForward(unittest.TestCase):
         for tensor in (q_centroids, k_centroids, v_means):
             self.assertTrue(torch.isfinite(tensor).all())
             self.assertTrue((tensor > 0).all())
+
+    def test_hyd_stats_match_first_order_reference(self):
+        q, k, v = _inputs(128, torch.bfloat16, seed=61)
+        q_centroids, k_centroids, v_means, h_sum = rdna35_pisa_ck.block_stats_hyd(q, k, v)
+        native = rdna35_pisa_ck._C.block_stats_hyd(q, k, v)
+
+        self.assertEqual(len(native), 5)
+        torch.testing.assert_close(native[0], q_centroids, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(native[1], k_centroids, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(native[2], v_means, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(native[3], h_sum, atol=0.0, rtol=0.0)
+        h_blocks = torch.stack(
+            [
+                torch.bmm(
+                    (k[:, start : start + BLOCK_SIZE].float() - k_centroids[:, block, None]).transpose(1, 2),
+                    v[:, start : start + BLOCK_SIZE].float(),
+                )
+                for block, start in enumerate(range(0, q.shape[1], BLOCK_SIZE))
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(native[4], torch.linalg.matrix_norm(h_blocks, dim=(-2, -1)), atol=1e-2, rtol=1e-3)
 
     def test_outer_torch_compile_fullgraph(self):
         q, k, v = _inputs(64, torch.bfloat16, seed=31)

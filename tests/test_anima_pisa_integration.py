@@ -91,16 +91,24 @@ class AnimaPISAIntegrationTests(unittest.TestCase):
             op(q, k, v)
         self.assertTrue(state.failed)
 
-    def test_installs_only_blocks_four_through_twenty_seven(self):
+    def test_installs_requested_layer_range(self):
         patcher = DummyPatcher()
 
-        patched = install_anima_pisa_attention(patcher, native_forward=Mock(), exact_blocks=23, device_index=0)
+        patched = install_anima_pisa_attention(
+            patcher,
+            native_forward=Mock(),
+            exact_blocks=23,
+            device_index=0,
+            first_layer=8,
+            last_layer=19,
+        )
 
-        self.assertEqual(patched, 24)
-        self.assertEqual(len(patcher.object_patches), 24)
-        self.assertNotIn("diffusion_model.blocks.3.self_attn.attn_op", patcher.object_patches)
-        self.assertIn("diffusion_model.blocks.4.self_attn.attn_op", patcher.object_patches)
-        self.assertIn("diffusion_model.blocks.27.self_attn.attn_op", patcher.object_patches)
+        self.assertEqual(patched, 12)
+        self.assertEqual(len(patcher.object_patches), 12)
+        self.assertNotIn("diffusion_model.blocks.7.self_attn.attn_op", patcher.object_patches)
+        self.assertIn("diffusion_model.blocks.8.self_attn.attn_op", patcher.object_patches)
+        self.assertIn("diffusion_model.blocks.19.self_attn.attn_op", patcher.object_patches)
+        self.assertNotIn("diffusion_model.blocks.20.self_attn.attn_op", patcher.object_patches)
 
 
 if __name__ == "__main__":

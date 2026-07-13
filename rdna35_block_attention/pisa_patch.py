@@ -6,7 +6,12 @@ from typing import Any, Callable
 
 import torch
 
-from .anima_pisa_integration import install_anima_pisa_attention, validate_anima_pisa_model
+from .anima_pisa_integration import (
+    ANIMA_PISA_FIRST_LAYER,
+    ANIMA_PISA_LAST_LAYER,
+    install_anima_pisa_attention,
+    validate_anima_pisa_model,
+)
 from .generic_pisa import make_generic_pisa_override
 from .pisa_runtime import PISA_RUNTIME_ATTACHMENT, PISARuntimeState
 
@@ -172,7 +177,8 @@ def patch_model_pisa_attention(
     exact_budget: float,
     token_policy: str,
     verbose_fallbacks: bool,
-    start_layer: int = 4,
+    start_layer: int = ANIMA_PISA_FIRST_LAYER,
+    end_layer: int = ANIMA_PISA_LAST_LAYER,
 ):
     if not enabled:
         return model, "disabled; model returned unchanged"
@@ -180,6 +186,8 @@ def patch_model_pisa_attention(
         return model, f"invalid exact_budget={exact_budget}; model returned unchanged"
     if token_policy not in TOKEN_POLICIES:
         return model, f"unsupported token_policy={token_policy}; model returned unchanged"
+    if not 0 <= start_layer <= end_layer < 28:
+        return model, f"invalid Anima layer range {start_layer}:{end_layer}; model returned unchanged"
     if not hasattr(model, "clone") or not hasattr(model, "model_options"):
         return model, "MODEL does not expose ComfyUI ModelPatcher clone/model_options; model returned unchanged"
 
@@ -222,8 +230,8 @@ def patch_model_pisa_attention(
         rdna35_pisa_ck.prepare()
     except (ImportError, OSError, RuntimeError, AttributeError) as exc:
         return model, f"rdna35-pisa-ck is unavailable ({type(exc).__name__}: {exc}); model returned unchanged"
-    if build_info.get("api") != 5:
-        return model, f"rdna35-pisa-ck API 5 is required, got {build_info.get('api')}; model returned unchanged"
+    if build_info.get("api") != 6:
+        return model, f"rdna35-pisa-ck API 6 is required, got {build_info.get('api')}; model returned unchanged"
     exact_blocks = math.ceil(exact_budget * 144)
     validated_exact_blocks = capabilities.get("spatial_sparse_exact_blocks")
     if not isinstance(validated_exact_blocks, (tuple, list)) or exact_blocks not in validated_exact_blocks:
@@ -234,7 +242,7 @@ def patch_model_pisa_attention(
 
     model_clone = model.clone()
     if hasattr(model_clone, "get_model_object") and hasattr(model_clone, "add_object_patch"):
-        runtime_state = PISARuntimeState(armed=True)
+        runtime_state = PISARuntimeState(armed=True, expected_layers=tuple(range(start_layer, end_layer + 1)))
         model_clone.set_attachments(PISA_RUNTIME_ATTACHMENT, runtime_state)
         try:
             patched_blocks = install_anima_pisa_attention(
@@ -242,12 +250,14 @@ def patch_model_pisa_attention(
                 native_forward=rdna35_pisa_ck.forward_spatial_bhtd,
                 exact_blocks=exact_blocks,
                 device_index=device_index,
+                first_layer=start_layer,
+                last_layer=end_layer,
                 runtime_state=runtime_state if verbose_fallbacks else None,
             )
         except (AttributeError, TypeError, ValueError) as exc:
             return model, f"validated Anima direct PISA integration is unavailable ({exc}); model returned unchanged"
         return model_clone, (
-            f"model-local gfx1151 direct PISA installed on Anima self-attention blocks {start_layer}:28 "
+            f"model-local gfx1151 direct PISA installed on Anima self-attention blocks {start_layer}:{end_layer} "
             f"at T=9216; exact_blocks={exact_blocks}; patched_blocks={patched_blocks}; "
             f"runtime_accounting={'enabled' if verbose_fallbacks else 'disabled'}"
         )
@@ -267,7 +277,7 @@ def patch_model_pisa_attention(
     tokens = ",".join(str(value) for value in sorted(TOKEN_POLICIES[token_policy]))
     info = (
         f"model-local gfx1151 PISA override installed for Anima spatial self-attention at T={tokens}; "
-        f"exact_budget={exact_budget:.6g}; start_layer={start_layer}"
+        f"exact_budget={exact_budget:.6g}; layers={start_layer}:{end_layer}"
     )
     if previous_override is not None:
         info += "; existing optimized_attention_override is chained for fallback"

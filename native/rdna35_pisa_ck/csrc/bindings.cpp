@@ -12,7 +12,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v);
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats_hyd(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> pisa_block_stats_hyd(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v);
@@ -72,7 +72,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
         info["api"] = RDNA35_PISA_CK_API;
         info["architecture"] = "gfx1151";
         info["ck_commit"] = "4975bd0c8e17a54bdc27c746527a385e7383bb07";
-        info["implementation"] = "ck_stats_flexattention_wmma";
+        info["implementation"] = "ck_hyd_routing_flexattention_wmma";
         info["torch_build_version"] = TORCH_VERSION;
         info["hip_build_version"] = pybind11::make_tuple(HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH);
         info["block_size"] = 64;

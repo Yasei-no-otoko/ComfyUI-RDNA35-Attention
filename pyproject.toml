@@ -1,7 +1,7 @@
 [project]
 name = "rdna35-attention"
 description = "RDNA3.5 attention research nodes for ComfyUI, including fixed-block, exact Triton, and PISA paths."
-version = "0.1.1"
+version = "0.1.2"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = []

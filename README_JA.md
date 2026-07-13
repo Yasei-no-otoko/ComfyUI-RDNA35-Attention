@@ -20,43 +20,49 @@ PISA CK/Flex経路はWindows・gfx1151・BF16専用です。`native/rdna35_pisa_
 
 ## gfx1151実測
 
-Anima INT8_ConvRot、1536x1536、Spectrum 30 steps、CFG 5、Euler/simple、batch 1、17 actual forwardsで再測定しました。ポジティブ・ネガティブは公式[Anima `example.png`](https://huggingface.co/circlestone-labs/Anima/blob/main/example.png)の埋め込みmetadataと完全に同一です。`mod_w_profile=off`のため、Spectrumによる追加quality conditioningはありません。
+`rdna35-pisa-ck` 0.7.1 API 6、PyTorch 2.14 ROCm 7.15、BF16 `B=2,H=16,T=9216,D=128`、23/144 exact-block profileで測定しました。
 
-| ComfyUI選択backend | PISA | Seed 856853657535148 | Seed 856853657535149 | Prompt E2E中央値 | Flash比 |
-|---|---:|---:|---:|---:|---:|
-| Flash Attention | 有効 | 64.337秒 | 66.217秒 | **65.277秒** | **-11.939秒 (-15.5%)** |
-| Flash Attention | 無効 | 71.816秒 | 82.616秒 | 77.216秒 | baseline |
-| SageAttention ROCm7 1.0.6 | 有効 | 78.609秒 | 80.541秒 | 79.575秒 | +2.359秒 (+3.1%) |
-| PyTorch SDPA | 有効 | 98.163秒 | 101.673秒 | 99.918秒 | +22.702秒 (+29.4%) |
-| SageAttention ROCm7 1.0.6 | 無効 | 149.090秒 | 151.760秒 | 150.425秒 | +73.209秒 (+94.8%) |
-| PyTorch SDPA | 無効 | 302.027秒 | 302.158秒 | 302.093秒 | +224.877秒 (+291.2%) |
-
-各backendは専用または同一resident processでwarm-up後に測定し、Prompt E2EにはSampler、VAE decode、preview出力を含めています。Flash/PISAは同一processのABBA順、SDPAとSageはそれぞれ専用processで未適用・PISA適用経路をwarm-up後に測定しました。backend固有Inductor compileを含むSDPA 719.036秒、Sage 490.612秒の初回runはsteady-state表から除外しています。
-
-PISA + SDPAおよびPISA + Sageの1-forward verifierは、対象self-attention `24/24`、cross-attention 0、fallback 0、runtime failure 0でした。verifierはlayerごとのDynamo再compileを誘発するため性能値には含めていません。再現用workflowは[workflows/Anima_INT8_ConvRot_PISA_E2E_Benchmark.json](workflows/Anima_INT8_ConvRot_PISA_E2E_Benchmark.json)です。PISA nodeの`enabled`を無効にすると、起動時に選択したbackend単体のbaselineになります。
-
-### INT8 ConvRot・model compile・Spectrumを除外したBF16切り分け
-
-品質低下の原因を分離するため、`anima_aestheticV10.safetensors`、標準KSampler、model compile nodeなしで再実行しました。解像度、プロンプト、seed、30 steps、CFG 5、Euler/simpleは同一です。以下はprocess順序を含む診断値であり、warm steady-stateのrelease benchmarkではありません。
-
-| 選択backend | PISA | Seed 856853657535148 | Seed 856853657535149 |
+| Spatial self-attention backend | 完全な1 call | 相対速度 | 短縮 |
 |---|---:|---:|---:|
-| Flash Attention | 無効 | 147.178秒 | 130.267秒 |
-| Flash Attention | 有効 | 122.257秒 | 126.271秒 |
-| PyTorch SDPA | 無効 | 709.650秒 | 567.443秒 |
-| PyTorch SDPA | 有効 | 184.900秒 | 184.358秒 |
-| SageAttention ROCm7 1.0.6 | 無効 | 289.465秒 | 267.070秒 |
-| SageAttention ROCm7 1.0.6 | 有効 | 148.298秒 | 146.293秒 |
+| ComfyUI Flash Attention | 46.411 ms | 1.000倍 | baseline |
+| RDNA35 PISA CK/Flex fused | **25.121 ms** | **1.848倍高速** | **21.290 ms (45.9%)** |
 
-純Flash、SDPA、Sageは同じ構図を維持し、深刻なノイズや余分な腕は再現しませんでした。一方、3種類すべてのPISA併用結果で、同方向の大きな構図変化と身体・看板の交差が発生しました。残るgeometry低下はfallback backend固有ではなくPISA近似に追従しています。INT8 ConvRot、Spectrum、model compileは以前の破綻を増幅した可能性がありますが、PISAによる構図変化の必須条件ではありません。
+CK kernelはQ/K/V centroid、first-order covariance行列、公式HYDのrouting biasに使うcovariance normを融合して計算します。
 
-非同期経路ではprogress barをGPU時間として利用できません。純Flashは30 stepsを約2秒と表示した一方でPrompt E2Eは128.80-146.06秒、純SDPAも約2秒表示に対してE2Eは566.64-708秒でした。PISA経路はstep loop内の待機が増えるため、119-181秒のprogress表示がE2Eへ近づきます。比較にはtqdmのiteration速度ではなく、同期後のPrompt E2EまたはGPU eventを使用します。
+### PISA論文とAnimaのlayer構造
 
-純BF16の再現workflowは[workflows/Anima_BF16_PISA_Pure_E2E_Benchmark.json](workflows/Anima_BF16_PISA_Pure_E2E_Benchmark.json)です。2つのbenchmark workflowには同一seed品質比較用の`SaveImage` nodeを既定無効で追加しています。保存時だけ有効化してbackend別prefixを設定してください。disk I/Oを性能値へ含めないため、既定では無効です。
+[PISA v2 Appendix E](https://arxiv.org/html/2602.01077v2)はSD3.5とFLUX.1で先頭4層をDenseに保ちます。ただし論文の70%/85% sparsityは、PISA対象層内で近似するKV blockの比率であり、Sparse化するtransformer層の割合ではありません。[公式FLUX processor](https://github.com/xie-lab-ml/piecewise-sparse-attention/blob/main/piecewise_attn/models/flux/flux_processor.py)もprocessor ID 0-3をDense SDPA、4以降をPISAへ送ります。
+
+| モデル | Transformer構造 | Dense層 | PISA層 | 層内sparsity |
+|---|---|---:|---:|---:|
+| SD3.5 Medium | 24 joint MMDiT blocks | 0-3 | 4-23 | 70% |
+| SD3.5 Large Turbo | 38 joint MMDiT blocks | 0-3 | 4-37 | 85% |
+| FLUX.1-dev | 19 double-stream + 38 single-stream blocks | 0-3 | 4-56 | 85% |
+| Cosmos-Predict2 2B / Anima | 同型のself-attention、cross-attention、MLP blockを28個 | **0-19** | **20-27** | **84.03% (23/144 exact)** |
+
+AnimaはCosmos-Predict2 2Bのfine-tuneであり、FLUX transformerではありません。28層はすべてimage self-attention、独立したtext cross-attention、MLPの同じ構造で、FLUXの19/38 phase境界はありません。従来の4-27設定は、構造の異なるFLUXの閾値を移してAnimaの28層中24層をSparse化していたため、大きな構図変化が発生しました。この設定は既定値および推奨benchmarkから外しました。
+
+### BF16 Anima layer search
+
+`anima_aestheticV10.safetensors`を1536x1536、標準KSampler、INT8 ConvRotなし、model compileなし、Spectrumなしで測定しました。プロンプトは公式[Anima `example.png`](https://huggingface.co/circlestone-labs/Anima/blob/main/example.png)と同一、30 steps、CFG 5、Euler/simple、batch 1、同一2 seedです。SSIM、RGB cosine、PSNRは同seedのDense Flash画像との比較です。時間はprocess順序を含む診断値で、warm release medianではありません。
+
+| Sparse self-attention層 | Seed 856853657535148 E2E | SSIM / cosine / PSNR | Seed 856853657535149 E2E | SSIM / cosine / PSNR | 判定 |
+|---|---:|---:|---:|---:|---|
+| なし (Flash) | 142.974秒 | 1 / 1 / inf | 128.265秒 | 1 / 1 / inf | Dense基準 |
+| **20-27** | **129.650秒** | .723942 / .963230 / 14.935 | **132.249秒** | .630565 / .896732 / 10.794 | 審美性重視の既定profile |
+| 24-27 | 129.220秒 | **.908147 / .993142 / 22.138** | 128.670秒 | **.781257 / .958885 / 14.717** | Flash近似重視profile |
+| 4-11、20-27 | 129.900秒 | .607146 / .929997 / 12.196 | 132.720秒 | .596093 / .885909 / 10.325 | text/layout低下で棄却 |
+| 0-3、8-11、16-19 | 147.100秒 | .575142 / .885335 / 10.003 | 145.910秒 | .571344 / .894699 / 10.619 | 低速かつtext低下で棄却 |
+
+20-27は知覚的な審美性で選択したため、数値上Flashへ最も近い設定ではありません。同seedのFlash忠実度を優先する場合は24-27を使用してください。nodeの`first_pisa_layer`と`last_pisa_layer`はinclusiveです。1 nodeは連続範囲を表し、複数nodeのchainで非連続な研究用設定も作れます。
+
+既定profileのruntime verifierはmodel forwardごとにPISA self-attention 8 call、cross-attention 0、対象fallback 0を要求します。再現workflowは[純BF16](workflows/Anima_BF16_PISA_Pure_E2E_Benchmark.json)と[INT8 ConvRot](workflows/Anima_INT8_ConvRot_PISA_E2E_Benchmark.json)で、どちらも20-27を明示保存しています。disk I/Oを性能値へ含めないため`SaveImage`は既定無効です。
+
+非同期attention経路ではprogress barをGPU時間として利用できません。比較にはtqdmのiteration速度ではなく、同期後のPrompt E2EまたはGPU eventを使用します。
 
 ## TODO
 
-- PISAとfallback backendの組み合わせを推奨する前に、構図・geometry低下を定量化する。BF16切り分けでINT8 ConvRot、model compile、Spectrumを除外すると深刻なノイズと余分な腕は再現しませんでしたが、身体・看板の交差はFlash、SDPA、Sageの全PISA経路に追従しました。同一seed matrixを拡張し、知覚指標とlayer別attention誤差を比較します。この品質gateを通過するまでPISAはexperimental扱いです。
+- 20-27 profileをexperimentalから昇格する前に、公式example以外のpromptと2 seedを超える品質matrixへ拡張し、知覚指標、prompt adherence、anatomy、文字、layer別attention誤差を比較します。
 
 ## 安全性と制限
 

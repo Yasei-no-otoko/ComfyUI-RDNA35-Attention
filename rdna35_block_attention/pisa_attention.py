@@ -223,8 +223,8 @@ def _load_ck_backend(q: torch.Tensor):
     except (AttributeError, RuntimeError) as exc:
         return None, f"ck_wheel_metadata_failed_{type(exc).__name__}: {exc}"
 
-    if info.get("api") != 5:
-        return None, f"ck_api_5_required_not_{info.get('api')}"
+    if info.get("api") != 6:
+        return None, f"ck_api_6_required_not_{info.get('api')}"
     if info.get("architecture") != "gfx1151" or capabilities.get("architecture") != "gfx1151":
         return None, "ck_wheel_architecture_mismatch"
     if info.get("torch_python_build_version") != torch.__version__:

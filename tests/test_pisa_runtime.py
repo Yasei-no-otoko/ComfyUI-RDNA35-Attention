@@ -14,8 +14,8 @@ from rdna35_block_attention.pisa_runtime import PISARuntimeState
 
 class PISARuntimeStateTests(unittest.TestCase):
     def test_expected_calls_uses_the_pisa_layer_range(self):
-        self.assertEqual(PISARuntimeState.expected_calls(17), 408)
-        self.assertEqual(PISARuntimeState.expected_calls(3, start_layer=2, total_layers=5), 9)
+        self.assertEqual(PISARuntimeState.expected_calls(17), 136)
+        self.assertEqual(PISARuntimeState.expected_calls(3, layers=range(2, 5)), 9)
         with self.assertRaisesRegex(ValueError, "non-negative"):
             PISARuntimeState.expected_calls(-1)
         with self.assertRaisesRegex(ValueError, "start_layer"):
@@ -40,23 +40,31 @@ class PISARuntimeStateTests(unittest.TestCase):
     def test_verify_requires_every_expected_layer_for_every_forward(self):
         state = PISARuntimeState(armed=True)
         for _ in range(2):
-            for layer in range(4, 28):
+            for layer in range(20, 28):
                 state.record(layer=layer, is_self_attention=True)
 
         self.assertTrue(state.verify(2))
         self.assertTrue(state.verified)
         self.assertFalse(state.failed)
-        self.assertIn("hits=48/48", state.report())
+        self.assertIn("hits=16/16", state.report())
 
     def test_verify_marks_incomplete_accounting_as_failed(self):
         state = PISARuntimeState(armed=True)
-        for layer in range(4, 27):
+        for layer in range(20, 27):
             state.record(layer=layer)
 
         self.assertFalse(state.verify(1))
         self.assertTrue(state.failed)
         self.assertFalse(state.verified)
-        self.assertEqual(state.first_error, "PISA hits=23, expected=24")
+        self.assertEqual(state.first_error, "PISA hits=7, expected=8")
+
+    def test_verify_uses_configured_layer_range(self):
+        state = PISARuntimeState(armed=True, expected_layers=tuple(range(8, 20)))
+        for layer in range(8, 20):
+            state.record(layer=layer)
+
+        self.assertTrue(state.verify(1))
+        self.assertIn("hits=12/12", state.report())
 
     def test_first_error_is_preserved_and_reset_clears_sample_state(self):
         state = PISARuntimeState(armed=True)
