@@ -287,7 +287,7 @@ def make_generic_pisa_override(
             runtime_state.record(is_self_attention=kwargs.get("is_self_attention"), shape=shape, fallback_reason=reason, context=context)
             return fallback(original_func, q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
 
-        grid_sizes = transformer_options.get("grid_sizes")
+        grid_sizes = transformer_options.get("attention_token_grid", transformer_options.get("grid_sizes"))
         video_layout = (
             isinstance(grid_sizes, (tuple, list))
             and len(grid_sizes) == 3
