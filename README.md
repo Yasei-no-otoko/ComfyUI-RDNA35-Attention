@@ -38,14 +38,43 @@ The production comparison uses `rdna35-pisa-ck` 0.7.0 API 5 on the local PyTorch
 | ComfyUI Flash Attention | 46.411 ms | 1.000x | baseline |
 | RDNA35 PISA CK/Flex fused | **25.121 ms** | **1.848x faster** | **21.290 ms (45.9%)** |
 
-The end-to-end comparison uses the same resident ComfyUI process after warm-up with Anima INT8_ConvRot, the 1536x1536 Spectrum workflow, 30 sampler steps, and 17 actual model forwards:
+The end-to-end comparison uses Anima INT8_ConvRot at 1536x1536, Spectrum 30 steps, CFG 5, Euler/simple, batch 1, and 17 actual model forwards. The positive and negative prompts exactly match the metadata embedded in the official [Anima `example.png`](https://huggingface.co/circlestone-labs/Anima/blob/main/example.png). `mod_w_profile=off`, so Spectrum does not add another quality-conditioning pass.
 
-| Backend | Sampler median | Prompt median | End-to-end gain |
+| Selected ComfyUI backend | PISA patch | Seed 856853657535148 | Seed 856853657535149 | Prompt E2E median | Difference from Flash |
+|---|---:|---:|---:|---:|---:|
+| Flash Attention | on | 64.337 s | 66.217 s | **65.277 s** | **-11.939 s (-15.5%)** |
+| Flash Attention | off | 71.816 s | 82.616 s | 77.216 s | baseline |
+| SageAttention ROCm7 1.0.6 | on | 78.609 s | 80.541 s | 79.575 s | +2.359 s (+3.1%) |
+| PyTorch SDPA | on | 98.163 s | 101.673 s | 99.918 s | +22.702 s (+29.4%) |
+| SageAttention ROCm7 1.0.6 | off | 149.090 s | 151.760 s | 150.425 s | +73.209 s (+94.8%) |
+| PyTorch SDPA | off | 302.027 s | 302.158 s | 302.093 s | +224.877 s (+291.2%) |
+
+Each backend was measured in a resident ComfyUI process after an excluded warm-up, and Prompt E2E includes sampling, VAE decode, and preview output. Flash/PISA used ABBA order in one process; SDPA and Sage each used a dedicated process and measured the unpatched and patched paths after their respective warm-ups. The first SDPA and Sage runs took 719.036 s and 490.612 s because they included backend-specific Inductor compilation and are not included in the steady-state table.
+
+The runtime verifier recorded `24/24` eligible self-attention calls, zero cross-attention calls, zero fallbacks, and no runtime failure for both PISA + SDPA and PISA + Sage in a one-forward validation run. The verifier itself triggers per-layer Dynamo recompilation and is therefore excluded from the performance table. The reproducible workflow is [workflows/Anima_INT8_ConvRot_PISA_E2E_Benchmark.json](workflows/Anima_INT8_ConvRot_PISA_E2E_Benchmark.json); disable its PISA node for the selected backend baseline. The native Q/K/V spatial pack is included in the complete attention call. The fused gfx1151 epilogue combines LSE weighting, FP32 correction, BF16 conversion, and block-major-to-raster output, while the spatial exact FlexAttention tile uses `BLOCK_N=32`.
+
+### BF16 isolation run without INT8 ConvRot, model compile, or Spectrum
+
+To separate the quality regression from the optimized workflow, `anima_aestheticV10.safetensors` was run with the standard KSampler and no model compile node. Resolution, prompts, seeds, 30 steps, CFG 5, and Euler/simple were kept unchanged. These are diagnostic process-order results, not warm steady-state release numbers:
+
+| Selected backend | PISA | Seed 856853657535148 | Seed 856853657535149 |
 |---|---:|---:|---:|
-| ComfyUI Flash Attention | 76.08 s | 78.54 s | baseline |
-| RDNA35 PISA CK/Flex fused | **65.94 s** | **68.38 s** | **10.16 s prompt (12.9%)** |
+| Flash Attention | off | 147.178 s | 130.267 s |
+| Flash Attention | on | 122.257 s | 126.271 s |
+| PyTorch SDPA | off | 709.650 s | 567.443 s |
+| PyTorch SDPA | on | 184.900 s | 184.358 s |
+| SageAttention ROCm7 1.0.6 | off | 289.465 s | 267.070 s |
+| SageAttention ROCm7 1.0.6 | on | 148.298 s | 146.293 s |
 
-The runtime verifier recorded `24/24` eligible self-attention calls, zero cross-attention calls, and zero fallbacks for one model forward. The table is an ABBA comparison in one resident process (Flash, PISA, PISA, Flash); unlike the superseded 0.7% table, it does not attribute a Flash fallback run to PISA. The native Q/K/V spatial pack is included in the complete call. The fused gfx1151 epilogue combines LSE weighting, FP32 correction, BF16 conversion, and block-major-to-raster output, while the spatial exact FlexAttention tile uses `BLOCK_N=32`.
+The pure Flash, SDPA, and Sage images retained the same composition and did not reproduce the severe noise or extra limb. All three PISA combinations produced a similar large composition shift and body/sign intersection, so the remaining geometry regression follows the PISA approximation rather than the fallback backend. INT8 ConvRot, Spectrum, or model compilation may amplify the earlier failures, but they are not required for PISA to change the composition.
+
+The progress bar is not a valid GPU timing source on these asynchronous paths. Pure Flash reported about 2 seconds for 30 steps while Prompt E2E was 128.80-146.06 seconds; pure SDPA similarly reported about 2 seconds while E2E was 566.64-708 seconds. PISA made the step loop blocking enough that its 119-181 second progress time closely tracked E2E. Use Prompt E2E or GPU events after synchronization, not tqdm iteration speed.
+
+The reproducible pure-BF16 workflow is [workflows/Anima_BF16_PISA_Pure_E2E_Benchmark.json](workflows/Anima_BF16_PISA_Pure_E2E_Benchmark.json). Both benchmark workflows include a disabled `SaveImage` node for matched-seed quality runs; enable it and set a backend-specific prefix when persistence is required. It remains disabled by default so disk I/O is excluded from timing.
+
+## TODO
+
+- Quantify the PISA composition and geometry regression before recommending any PISA + fallback combination. The BF16 isolation run removed INT8 ConvRot, model compile, and Spectrum: severe noise and the extra arm did not reproduce, but body/sign intersections followed PISA with Flash, SDPA, and Sage. Expand the matched-seed matrix and compare perceptual metrics plus per-layer attention error. PISA remains experimental until this quality gate passes.
 
 The generic benchmark below uses identical synthetic Q/K/V tensors and GPU-event medians after warm-up. Sage is [SageAttention ROCm7 1.0.6](https://github.com/guinmoon/SageAttention-Rocm7/releases/tag/v1.0.6_rocm7). These are kernel-level measurements, not end-to-end image quality results:
 
