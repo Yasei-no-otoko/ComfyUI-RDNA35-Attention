@@ -146,7 +146,7 @@ Otherwise dispatch falls back to the PyTorch reference implementation with a rea
 - SD1.5/SDXL, Wan, Wan AR, and LTX use generic PISA only for explicitly marked, unmasked self-attention with matching Q/K/V and `T>=8192`. Cross-attention, GQA, short sequences, Wan KV-cache attention, and LTX guide masks chain to the previous ComfyUI backend
 - SDXL `T=4032,D=64` fallback execution is verified. Wan dispatch is covered by synthetic contract tests. LTX 2.3 is verified to complete an actual 768x768, 73-frame workflow with safe short-sequence fallback, but neither model has a production PISA quality/performance profile
 - A generic CK/Triton/Flex compile failure falls back to the previous attention backend; an out-of-memory error remains fatal so a second large allocation is not attempted
-- First use compiles two FlexAttention kernels; benchmark cold and steady-state runs separately
+- First use compiles the selected-block FlexAttention kernel and the dense centroid approximation through Inductor/Triton; benchmark cold and steady-state runs separately
 - PISA output is approximate and can change composition relative to Flash Attention
 - Spatial sparse PISA accepts only the validated 23 exact blocks; other sparse budgets are rejected after real-model non-finite results at 32/33/36
 - Fixed `block_size=64`
