@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5 - 2026-08-12
+
+- Select PyTorch SDPA/AOTriton for the gfx1151 MiniMax-H3 workflow instead of the CUDA-only Comfy Kitchen SageAttention path.
+
 ## 0.1.4 - 2026-08-12
 
 - Add the MiniMax-H3 gfx1151 layout optimization README and dedicated R2V workflow.
