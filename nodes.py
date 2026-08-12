@@ -12,6 +12,11 @@ from .rdna35_block_attention.diagnostics import detect_runtime, explain_dispatch
 from .rdna35_block_attention.dispatch import fixed_block_attention
 from .rdna35_block_attention.full_attention import full_attention_triton
 from .rdna35_block_attention.generic_pisa import generic_pisa_attention
+from .rdna35_block_attention.minimax_h3_gfx1151_attention import (
+    minimax_h3_pack_profile,
+    pack_minimax_h3_qkv,
+    patch_minimax_h3_gfx1151_attention,
+)
 from .rdna35_block_attention.pisa_attention import pisa_attention
 from .rdna35_block_attention.pisa_patch import patch_model_pisa_attention
 from .rdna35_block_attention.pisa_runtime import PISA_RUNTIME_ATTACHMENT
@@ -111,6 +116,31 @@ class RDNA35PatchAnimaPISAAttention:
         )
 
 
+class RDNA35PatchMiniMaxH3GFX1151Attention:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {"default": True}),
+                "verbose_fallbacks": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "info")
+    FUNCTION = "patch"
+    CATEGORY = "RDNA35/Attention Research"
+    EXPERIMENTAL = True
+
+    def patch(self, model, enabled, verbose_fallbacks):
+        return patch_minimax_h3_gfx1151_attention(
+            model,
+            enabled=enabled,
+            verbose_fallbacks=verbose_fallbacks,
+        )
+
+
 def _sync_if_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -137,6 +167,29 @@ def _median_ms(fn, device: torch.device, iterations: int = 20, warmup: int = 5) 
         fn()
         samples.append((time.perf_counter() - start) * 1000.0)
     return float(statistics.median(samples))
+
+
+def _alternating_medians_ms(first_fn, second_fn, device: torch.device, iterations: int, warmup: int) -> tuple[float, float]:
+    for _ in range(warmup):
+        first_fn()
+        second_fn()
+    _sync_if_cuda(device)
+
+    first_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+    first_ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+    second_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+    second_ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+    for first_start, first_end, second_start, second_end in zip(first_starts, first_ends, second_starts, second_ends):
+        first_start.record()
+        first_fn()
+        first_end.record()
+        second_start.record()
+        second_fn()
+        second_end.record()
+    torch.cuda.synchronize(device)
+    first_ms = statistics.median(start.elapsed_time(end) for start, end in zip(first_starts, first_ends))
+    second_ms = statistics.median(start.elapsed_time(end) for start, end in zip(second_starts, second_ends))
+    return float(first_ms), float(second_ms)
 
 
 class RDNA35FixedBlockAttentionBenchmark:
@@ -252,6 +305,69 @@ class RDNA35FullAttentionBenchmark:
             f"Triton/SDPA ratio: {triton_ms / sdpa_ms:.3f}x",
             f"max abs error: {(output.float() - reference.float()).abs().max().item():.6g}",
             f"kernel config: {info.get('config')}",
+        ]),)
+
+
+class RDNA35MiniMaxH3GFX1151AttentionBenchmark:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tokens": ("INT", {"default": 9170, "min": 4608, "max": 16500, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("benchmark",)
+    FUNCTION = "run"
+    CATEGORY = "RDNA35/Attention Research"
+    OUTPUT_NODE = True
+    EXPERIMENTAL = True
+
+    def run(self, tokens):
+        device = torch.device("cuda")
+        if not torch.cuda.is_available() or torch.version.hip is None:
+            raise RuntimeError("PyTorch ROCm GPU is required")
+        target = str(getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")).split(":", 1)[0]
+        if target != "gfx1151":
+            raise RuntimeError(f"gfx1151 is required, got {target or 'unknown'}")
+        qkv = torch.randn(1, tokens, 3, 56, 128, device=device, dtype=torch.bfloat16)
+        q = qkv[:, :, 0].permute(0, 2, 1, 3)
+        k = qkv[:, :, 1].permute(0, 2, 1, 3)
+        v = qkv[:, :, 2].clone().permute(0, 2, 1, 3)
+
+        def existing_attention():
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v).transpose(1, 2).contiguous()
+
+        def packed_attention():
+            packed_q, packed_k, packed_v, _ = pack_minimax_h3_qkv(q, k, v)
+            return torch.nn.functional.scaled_dot_product_attention(packed_q, packed_k, packed_v).transpose(1, 2).contiguous()
+
+        existing_output = existing_attention()
+        packed_output = packed_attention()
+        if not torch.isfinite(packed_output).all():
+            raise RuntimeError("packed attention produced non-finite output")
+        if not torch.allclose(packed_output.float(), existing_output.float(), atol=5e-2, rtol=5e-2):
+            raise RuntimeError("packed attention failed the BF16 correctness check")
+        existing_ms, packed_ms = _alternating_medians_ms(existing_attention, packed_attention, device, iterations=5, warmup=2)
+        max_error = (packed_output.float() - existing_output.float()).abs().max().item()
+        cosine = torch.nn.functional.cosine_similarity(
+            packed_output.float().flatten(),
+            existing_output.float().flatten(),
+            dim=0,
+        ).item()
+        return ("\n".join([
+            "RDNA35 MiniMax-H3 gfx1151 Attention Benchmark",
+            f"torch: {torch.__version__} hip={torch.version.hip} backend={torch.backends.cuda.preferred_rocm_fa_library()}",
+            f"shape: B=1 H=56 T={tokens} D=128 dtype={torch.bfloat16}",
+            "timing: 2 warmups, 5 alternating GPU-event samples (quick diagnostic)",
+            f"packing profile: {minimax_h3_pack_profile(tokens).upper()}",
+            f"existing strided SDPA median: {existing_ms:.3f} ms",
+            f"packed SDPA median: {packed_ms:.3f} ms",
+            f"measured speedup: {existing_ms / packed_ms:.3f}x",
+            f"time reduction: {existing_ms - packed_ms:.3f} ms ({(1.0 - packed_ms / existing_ms) * 100.0:.1f}%)",
+            f"max abs error: {max_error:.6g}",
+            f"cosine similarity: {cosine:.9f}",
         ]),)
 
 
@@ -470,8 +586,10 @@ NODE_CLASS_MAPPINGS: dict[str, Any] = {
     "RDNA35BlockAttentionDiagnostics": RDNA35BlockAttentionDiagnostics,
     "RDNA35PatchModelAttention": RDNA35PatchModelAttention,
     "RDNA35PatchAnimaPISAAttention": RDNA35PatchAnimaPISAAttention,
+    "RDNA35PatchMiniMaxH3GFX1151Attention": RDNA35PatchMiniMaxH3GFX1151Attention,
     "RDNA35FixedBlockAttentionBenchmark": RDNA35FixedBlockAttentionBenchmark,
     "RDNA35FullAttentionBenchmark": RDNA35FullAttentionBenchmark,
+    "RDNA35MiniMaxH3GFX1151AttentionBenchmark": RDNA35MiniMaxH3GFX1151AttentionBenchmark,
     "RDNA35PISAAttentionBenchmark": RDNA35PISAAttentionBenchmark,
     "RDNA35GenericPISABenchmark": RDNA35GenericPISABenchmark,
     "RDNA35PISARuntimeReport": RDNA35PISARuntimeReport,
@@ -481,8 +599,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RDNA35BlockAttentionDiagnostics": "RDNA35 Block Attention Diagnostics",
     "RDNA35PatchModelAttention": "RDNA35 Patch Model Attention",
     "RDNA35PatchAnimaPISAAttention": "RDNA35 Patch PISA Attention",
+    "RDNA35PatchMiniMaxH3GFX1151Attention": "RDNA35 Patch MiniMax-H3 gfx1151 Attention",
     "RDNA35FixedBlockAttentionBenchmark": "RDNA35 Fixed Block Attention Benchmark",
     "RDNA35FullAttentionBenchmark": "RDNA35 Exact Full Attention Benchmark",
+    "RDNA35MiniMaxH3GFX1151AttentionBenchmark": "RDNA35 MiniMax-H3 gfx1151 Attention Benchmark",
     "RDNA35PISAAttentionBenchmark": "RDNA35 PISA Attention Benchmark",
     "RDNA35GenericPISABenchmark": "RDNA35 Generic PISA Benchmark",
     "RDNA35PISARuntimeReport": "RDNA35 PISA Runtime Report",
