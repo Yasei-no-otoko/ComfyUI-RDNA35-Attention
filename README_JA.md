@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-PyTorch ROCm向けのComfyUIカスタムノードです。固定64-token block-diagonal self-attention、gfx1151用exact full-attention研究kernel、Anima 1536x1536向けPISA HYD経路を提供します。
+PyTorch ROCm向けのComfyUIカスタムノードです。固定64-token block-diagonal self-attention、gfx1151用exact full-attention研究kernel、MiniMax-H3専用QKV layout最適化、Anima 1536x1536向けPISA HYD経路を提供します。
 
 通常のComfyUI attentionをグローバル置換しません。MODELをcloneし、明示的なself-attention markerと検証済みshapeを満たす呼び出しだけをmodel-localに切り替えます。PISAは近似計算でありopt-inです。
 
@@ -19,6 +19,25 @@ Gitから導入する場合は、このrepositoryを`ComfyUI/custom_nodes`へclo
 PISA CK/Flex経路はWindows・gfx1151・BF16専用です。`native/rdna35_pisa_ck`を使用中のPyTorch/ROCm環境でビルドし、wheelを`pip install --no-deps`で導入する必要があります。generic fixed-block reference/Triton nodesはこのnative wheelなしでも使用できます。
 
 ## gfx1151実測
+
+### MiniMax-H3 exact attention layout
+
+MiniMax-H3 native実装のQ/Kはfused QKV projection上のinterleaved viewです。gfx1151では長いtoken strideのままexact SDPAへ渡すと大幅に低速化するため、専用node `RDNA35 Patch MiniMax-H3 gfx1151 Attention` はBF16 `B=1,H=56,D=128,4608<=T<=16500`だけを対象に、`T<12000`でKV、`T>=12000`でQKVを1回の`torch.stack`へpackしてから既存のexact attention backendへ渡します。Attentionの数式や選択済みbackendは変更しません。
+
+PyTorch 2.14 / ROCm 7.15、AOTriton、warmup 5回後にraw→optimizedを交互に20回GPU event測定した中央値です。
+
+| MiniMax-H3 shape | native interleaved call | H3 packed call | 高速化 | 短縮 |
+|---|---:|---:|---:|---:|
+| `B=1,H=56,T=9170,D=128` (KV pack) | 311.660 ms | **86.736 ms** | **3.593倍** | **224.925 ms (72.2%)** |
+| `B=1,H=56,T=16500,D=128` (QKV pack) | 2264.434 ms | **280.344 ms** | **8.077倍** | **1984.090 ms (87.6%)** |
+
+両shapeでBF16出力はbit一致しました（最大絶対誤差0、cosine 1.0）。これは実測結果で、correctness gateはBF16 `allclose(atol=rtol=5e-2)`です。計測範囲には毎callのpack、exact SDPA、最終output layout変換を含み、QKV projection、RMSNorm、RoPE、入力view作成は含みません。sampling workflow全体の時間ではありません。stack allocation単体は`T=9170`で約251 MiB、`T=16500`で約677 MiBで、model tensor、attention output、backend workspaceは別途必要です。`T<4608`、`T>16500`、既にpacked済みの入力、mask/GQA/causal/training、MiniMax-H3以外、gfx1151以外は既存経路へchainします。
+
+WSL2 MagpieからWindows ROCm Pythonを呼ぶBF16 `T=4608` smoke testはnative/packedともcorrectness合格（2/2）でした。Magpie performanceはskipされscoreがnullのため、表示上の`Winner: Kernel 0`は速度順位として使わず、上表は直接GPU-event中央値を使用しています。
+
+専用benchmark node `RDNA35 MiniMax-H3 gfx1151 Attention Benchmark` は同じnative interleaved layoutを生成し、既存SDPAとpacked SDPAの時間・誤差を比較します。
+
+### Anima PISA
 
 `rdna35-pisa-ck` 0.7.1 API 6、PyTorch 2.14 ROCm 7.15、BF16 `B=2,H=16,T=9216,D=128`、23/144 exact-block profileで測定しました。
 
@@ -67,6 +86,7 @@ AnimaはCosmos-Predict2 2Bのfine-tuneであり、FLUX transformerではあり�
 ## 安全性と制限
 
 - inference forward専用
+- MiniMax-H3 layout最適化はROCm gfx1151・BF16専用で、追加のcall-local一時メモリを使用し、`T<4608`または`T>16500`は変更しない
 - block sizeは64固定
 - arbitrary maskとcross-attentionをblock-localへ変換しない
 - PISAはAnima `T=9216`、BF16、検証済み23/144 sparse profileのみ

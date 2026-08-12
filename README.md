@@ -8,9 +8,10 @@
 
 ComfyUI custom nodes for fixed 64-token block-diagonal self-attention on PyTorch ROCm with an optional Triton forward kernel. This is not a port of NVIDIA Blackwell TLX code.
 
-The package also contains two isolated gfx1151 research paths. Neither replaces normal ComfyUI attention globally:
+The package also contains isolated gfx1151 research paths. None replaces normal ComfyUI attention globally:
 
 - Exact full attention with an online-softmax Triton kernel for `[BH,Q,D] x [BH,K,D]`.
+- A MiniMax-H3-only QKV layout optimizer that keeps the selected ComfyUI attention backend unchanged.
 - A training-free PISA HYD path using a compiled CK Tile statistics wheel, FlexAttention, and WMMA correction.
 
 ## What This Implements
@@ -24,12 +25,31 @@ The Triton path is forward/inference only. There is no custom autograd or backwa
 - `RDNA35 Block Attention Diagnostics`: reports PyTorch, HIP, device, best-effort gfx target, Triton availability, and RDNA3.5 detection.
 - `RDNA35 Patch Model Attention`: installs a model-local `optimized_attention_override` on a cloned MODEL. It never globally monkey-patches ComfyUI attention.
 - `RDNA35 Patch PISA Attention`: installs a model-local PISA override. Anima keeps its validated `T=9216,D=128` spatial path. Explicitly marked SD1.5, SDXL, Wan, and LTX self-attention with `T>=8192` uses the generic path; cross-attention, masks, short sequences, and unsupported devices chain to the previous ComfyUI backend.
+- `RDNA35 Patch MiniMax-H3 gfx1151 Attention`: installs a model-local, MiniMax-H3-only BF16 layout optimizer. Long native interleaved Q/K/V views are packed before they are passed to the existing exact attention backend; short, masked, training, non-H3, and non-gfx1151 calls are unchanged.
 - `RDNA35 Fixed Block Attention Benchmark`: creates synthetic Q/K/V tensors, compares reference, dispatch, PyTorch SDPA with a block-diagonal mask, and normal PyTorch full SDPA. Full SDPA is reported as a semantic contrast, not as an exact replacement.
 - `RDNA35 Exact Full Attention Benchmark`: compares the gfx1151 online-softmax kernel with PyTorch SDPA for Anima-like self- and cross-attention shapes.
+- `RDNA35 MiniMax-H3 gfx1151 Attention Benchmark`: compares native H3 interleaved Q/K/V against the H3-only packed layout on `B=1,H=56,D=128`.
 - `RDNA35 PISA Attention Benchmark`: separates first-use compile time from GPU-event steady-state time and compares the CK/Flex hybrid with dense SDPA.
 - `RDNA35 Generic PISA Benchmark`: compares generic PISA, ComfyUI PyTorch SDPA, Flash Attention, and the optional SageAttention ROCm7 backend on one synthetic input. SageAttention supports only its advertised head dimensions; unsupported shapes are reported without aborting the other measurements.
 
 ## Measured gfx1151 results
+
+### MiniMax-H3 exact attention layout
+
+MiniMax-H3 produces Q and K as interleaved views of its fused QKV projection. On gfx1151, the selected exact SDPA backend is much slower when it repeatedly traverses those large token strides. The H3-only override packs KV for `4608 <= T < 12000` and QKV for `12000 <= T <= 16500` in one `torch.stack` allocation, then calls the existing attention backend with the original arguments. It does not replace or approximate the attention math.
+
+PyTorch 2.14 / ROCm 7.15 with AOTriton selected, BF16, five warmups and 20 alternating GPU-event samples produced:
+
+| MiniMax-H3 shape | Native interleaved call | H3 packed call | Speedup | Time reduction |
+|---|---:|---:|---:|---:|
+| `B=1,H=56,T=9170,D=128` (KV pack) | 311.660 ms | **86.736 ms** | **3.593x** | **224.925 ms (72.2%)** |
+| `B=1,H=56,T=16500,D=128` (QKV pack) | 2264.434 ms | **280.344 ms** | **8.077x** | **1984.090 ms (87.6%)** |
+
+Both outputs were bit-identical in the measured BF16 calls (`max abs error=0`, cosine similarity `1.0`). This is an observation, while the correctness gate remains BF16 `allclose(atol=rtol=5e-2)`. The timed region includes per-call packing, exact SDPA, and final output layout conversion; QKV projection, RMSNorm, RoPE, and creation of the input views are outside it. These are attention-call measurements, not full sampling-workflow timings. The stack allocation alone is about 251 MiB at `T=9170` and 677 MiB at `T=16500`, in addition to the model tensors, attention output, and backend workspace. `T<4608`, `T>16500`, already-packed inputs, and unsupported calls remain on the existing path because packing is not validated as beneficial there.
+
+A WSL2 Magpie comparison invoking the Windows ROCm Python passed correctness for both native and packed paths at BF16 `T=4608` (2/2). Magpie performance was intentionally skipped and its performance scores were null, so its default `Winner: Kernel 0` is not a speed ranking; the table uses direct GPU-event medians.
+
+### Anima PISA
 
 The production comparison uses `rdna35-pisa-ck` 0.7.1 API 6 on the local PyTorch 2.14 ROCm 7.15 stack. The attention measurement is BF16 `B=2,H=16,T=9216,D=128` with the validated 23/144 exact-block profile:
 
@@ -149,6 +169,8 @@ If a safe local model patch cannot be installed, the node returns the original m
 
 `RDNA35 Patch Anima PISA Attention` patches only the selected Anima image self-attention modules on a cloned model. The default `anima_1536_spatial` profile keeps layers 0-19 dense and converts layers 20-27. It never converts cross-attention, masked calls, FP16 calls, or another sequence length. Its intra-layer sparse profile is fixed at 23 exact blocks out of 144. Once a native/Flex call starts, failures are surfaced instead of retrying another backend on the same asynchronous stream.
 
+`RDNA35 Patch MiniMax-H3 gfx1151 Attention` accepts only native `comfy.ldm.minimax.model.MiniMaxH3Model` calls with BF16 `B=1,H=56,D=128`, merged output, no mask, no GQA, no causal mode, no gradients, and `4608<=T<=16500`. It only changes Q/K/V storage layout and chains a normal previous model-local override or the selected ComfyUI backend for the exact attention operation. If a container-aware model-local override is already installed, the H3 patch is not installed rather than bypassing that contract. The packed tensors live for one call and are not cached across executions.
+
 ## Optimized Dispatch Conditions
 
 The Triton kernel is used only when all of these are true:
@@ -169,6 +191,7 @@ Otherwise dispatch falls back to the PyTorch reference implementation with a rea
 ## Limitations
 
 - Forward/inference only
+- The MiniMax-H3 layout optimizer is ROCm gfx1151 BF16-only, uses additional temporary memory, and leaves `T<4608` or `T>16500` unchanged
 - The optimized PISA paths are gfx1151-only
 - Generic PISA prioritizes the fused CK HYD statistics profile for BF16 `D=128`; FP16 and other head dimensions up to 256 use the fused Triton statistics fallback
 - SD1.5/SDXL, Wan, Wan AR, and LTX use generic PISA only for explicitly marked, unmasked self-attention with matching Q/K/V and `T>=8192`. Cross-attention, GQA, short sequences, Wan KV-cache attention, and LTX guide masks chain to the previous ComfyUI backend
@@ -196,6 +219,17 @@ $py = 'C:\Users\HarutoWatanabe\AppData\Local\Programs\Python\Python313\python.ex
 Reference-only tests run on CPU. Triton tests skip automatically when ROCm/Triton is unavailable.
 
 ## Benchmark
+
+MiniMax-H3 native-layout comparison:
+
+```powershell
+& C:\ComfyUI\custom_nodes\ComfyUI-RDNA35-Attention\scripts\run_minimax_h3_attention_bench.ps1 --tokens 9170 --warmup 5 --iterations 20 --check
+& C:\ComfyUI\custom_nodes\ComfyUI-RDNA35-Attention\scripts\run_minimax_h3_attention_bench.ps1 --tokens 16500 --warmup 5 --iterations 20 --check
+```
+
+The launcher recreates the tested Windows ROCm environment, requires gfx1151 and AOTriton, and creates the native H3 interleaved Q/K/V layout. `--check` compares the packed path with the unmodified exact SDPA output before timing. The CLI is the canonical performance measurement; the ComfyUI benchmark node is a quicker 2-warmup/5-sample alternating diagnostic and reports its selected backend.
+
+Fixed-block comparison:
 
 ```powershell
 $py = 'C:\Users\HarutoWatanabe\AppData\Local\Programs\Python\Python313\python.exe'
