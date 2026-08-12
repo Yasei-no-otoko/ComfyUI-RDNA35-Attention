@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4 - 2026-08-12
+
+- Add the MiniMax-H3 gfx1151 layout optimization README and dedicated R2V workflow.
+
 ## 0.1.2 - 2026-07-14
 
 - Fuse Anima HYD centroids, first-order covariance statistics, and routing bias in the gfx1151 native kernel.
