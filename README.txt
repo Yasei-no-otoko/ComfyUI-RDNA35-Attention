@@ -42,7 +42,9 @@ gate は allclose(atol=rtol=5e-2) です。pack allocation 単体は T=9170 で�
 ------------
 
 `workflows/video_minimax_h3_r2v_gfx1151_mixed_fp16_audio_spectrum_ck_attention_rdna35_h3_attention.json`
-は、ComfyUI の現行 MiniMax-H3 R2V gfx1151 + CK/Spectrum workflow の専用コピーです。
+は、ComfyUI の現行 MiniMax-H3 R2V gfx1151 + PyTorch SDPA/AOTriton/Spectrum
+workflow の専用コピーです。gfx1151/ROCm では CUDA 専用の Comfy Kitchen
+SageAttention を選択せず、PyTorch SDPA が AOTriton を選択します。
 元の workflow は変更せず、次の model chain にパッチ node を追加しています。
 
   UNETLoader -> ModelAttentionBackend -> RDNA35 Patch MiniMax-H3 gfx1151 Attention

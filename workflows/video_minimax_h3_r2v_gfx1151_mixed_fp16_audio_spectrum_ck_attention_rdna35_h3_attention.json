@@ -537,7 +537,7 @@
         "Node name for S&R": "ModelAttentionBackend"
       },
       "widgets_values": [
-        "comfy kitchen attention"
+        "pytorch attention"
       ]
     },
     {
